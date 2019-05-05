@@ -8,7 +8,7 @@ import ScopeSearch from './commands/private-cmds/_search-cmd';
 import ScopeShow from './commands/private-cmds/_show-cmd';
 import Export from './commands/public-cmds/export-cmd';
 import List from './commands/public-cmds/list-cmd';
-import Commit from './commands/public-cmds/commit-cmd';
+import Commit from './commands/public-cmds/tag-cmd';
 import Import from './commands/public-cmds/import-cmd';
 import Install from './commands/public-cmds/install-cmd';
 import ClearCache from './commands/public-cmds/clear-cache-cmd';
@@ -26,6 +26,8 @@ import Put from './commands/private-cmds/_put-cmd';
 import Fetch from './commands/private-cmds/_fetch-cmd';
 import Log from './commands/public-cmds/log-cmd';
 import Build from './commands/public-cmds/build-cmd';
+import EjectConf from './commands/public-cmds/eject-conf-cmd';
+import InjectConf from './commands/public-cmds/inject-conf-cmd';
 import CiUpdate from './commands/private-cmds/ci-update-cmd';
 import RefreshScope from './commands/private-cmds/refresh-scope-cmd';
 import CatScope from './commands/private-cmds/cat-scope-cmd';
@@ -46,6 +48,9 @@ import Merge from './commands/public-cmds/merge-cmd';
 import Diff from './commands/public-cmds/diff-cmd';
 import Login from './commands/public-cmds/login-cmd';
 import Logout from './commands/public-cmds/logout-cmd';
+import Eject from './commands/public-cmds/eject-cmd';
+import Watch from './commands/public-cmds/watch-cmd';
+import Doctor from './commands/public-cmds/doctor-cmd';
 
 export default function registerCommands(extensionsCommands): CommandRegistrar {
   return new CommandRegistrar(
@@ -76,6 +81,8 @@ export default function registerCommands(extensionsCommands): CommandRegistrar {
       new ScopeShow(),
       new Fetch(),
       new Build(),
+      new EjectConf(),
+      new InjectConf(),
       new DescribeScope(),
       new CiUpdate(),
       new RefreshScope(),
@@ -97,7 +104,10 @@ export default function registerCommands(extensionsCommands): CommandRegistrar {
       new Diff(),
       new Login(),
       new Logout(),
-      new Migrate()
+      new Eject(),
+      new Migrate(),
+      new Watch(),
+      new Doctor()
     ],
     extensionsCommands
   );

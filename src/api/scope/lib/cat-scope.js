@@ -1,10 +1,11 @@
 /** @flow */
-import { loadScope } from '../../../scope';
-import Component from '../../../scope/models/component';
+import { loadScope, Scope } from '../../../scope';
+import ModelComponent from '../../../scope/models/model-component';
 import BitObject from '../../../scope/objects/object';
+import Symlink from '../../../scope/models/symlink';
 
-export default function catScope(path: string, full: boolean): Promise<Component[] | BitObject[]> {
-  return loadScope(path).then((scope) => {
-    return full ? scope.objects.list() : scope.objects.listComponents();
-  });
-}
+export default (async function catScope(path: string, full: boolean): Promise<BitObject[]> {
+  const scope: Scope = await loadScope(path);
+  const bitObjects = await scope.objects.list();
+  return full ? bitObjects : bitObjects.filter(obj => obj instanceof ModelComponent || obj instanceof Symlink);
+});

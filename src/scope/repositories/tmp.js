@@ -5,6 +5,7 @@ import * as path from 'path';
 import Repository from '../repository';
 import { BIT_TMP_DIRNAME } from '../../constants';
 import type { PathOsBased } from '../../utils/path';
+import logger from '../../logger/logger';
 
 export default class Tmp extends Repository {
   getPath(): string {
@@ -15,15 +16,11 @@ export default class Tmp extends Repository {
     return path.join(this.getPath(), p);
   }
 
-  save(data: string, ext: string = '.js'): Promise<PathOsBased> {
-    return new Promise((resolve, reject) => {
-      const fileName = v4();
-      const filePath = this.composePath(`${fileName}${ext}`);
-      fs.outputFile(filePath, data, (err) => {
-        if (err) return reject(err);
-        return resolve(filePath);
-      });
-    });
+  async save(data: string, ext: string = '.js'): Promise<PathOsBased> {
+    const fileName = v4();
+    const filePath = this.composePath(`${fileName}${ext}`);
+    await fs.outputFile(filePath, data);
+    return filePath;
   }
 
   saveSync(data: string, ext: string = '.js'): PathOsBased {
@@ -34,27 +31,28 @@ export default class Tmp extends Repository {
   }
 
   remove(fileNameOrPath: string, ext: string = '.js'): Promise<any> {
-    return new Promise((resolve, reject) => {
-      const fileName = path.parse(fileNameOrPath).name;
-      const filePath = this.composePath(`${fileName}${ext}`);
-      fs.remove(filePath, (err) => {
-        if (err) return reject(err);
-        return resolve();
-      });
-    });
+    const fileName = path.parse(fileNameOrPath).name;
+    const filePath = this.composePath(`${fileName}${ext}`);
+    logger.info(`tmp.remove, deleting ${filePath}`);
+    return fs.remove(filePath);
   }
 
   removeSync(fileNameOrPath: string, ext: string = '.js'): any {
     const fileName = path.parse(fileNameOrPath).name;
     const filePath = this.composePath(`${fileName}${ext}`);
+    logger.info(`tmp.removeSync, deleting ${filePath}`);
     return fs.removeSync(filePath);
   }
 
   clear(): Promise<any> {
-    return fs.emptyDir(this.getPath());
+    const dirToDelete = this.getPath();
+    logger.info(`tmp.clear, deleting ${dirToDelete}`);
+    return fs.emptyDir(dirToDelete);
   }
 
   clearSync(): any {
-    return fs.emptyDirSync(this.getPath());
+    const dirToDelete = this.getPath();
+    logger.info(`tmp.clearSync, deleting ${dirToDelete}`);
+    return fs.emptyDirSync(dirToDelete);
   }
 }

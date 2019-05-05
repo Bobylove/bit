@@ -1,7 +1,9 @@
-import Component from './component';
+// @flow
+
+import ModelComponent from './model-component';
 import ScopeMeta from './scopeMeta';
 import Source from './source';
 import Version from './version';
 import Symlink from './symlink';
 
-export { Component, ScopeMeta, Source, Version, Symlink };
+export { ModelComponent, ScopeMeta, Source, Version, Symlink };

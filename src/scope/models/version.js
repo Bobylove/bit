@@ -1,17 +1,13 @@
 /** @flow */
 import R from 'ramda';
-import semver from 'semver';
-import packageNameValidate from 'validate-npm-package-name';
 import { Ref, BitObject } from '../objects';
-import Scope from '../scope';
 import Source from './source';
-import { filterObject, first, bufferFrom, getStringifyArgs, isValidPath } from '../../utils';
-import ConsumerComponent from '../../consumer/component';
+import { filterObject, first, bufferFrom, getStringifyArgs } from '../../utils';
 import type { customResolvedPath } from '../../consumer/component';
+import ConsumerComponent from '../../consumer/component';
 import { BitIds, BitId } from '../../bit-id';
-import ComponentVersion from '../component-version';
 import type { Doclet } from '../../jsdoc/parser';
-import { DEFAULT_BUNDLE_FILENAME, DEFAULT_BINDINGS_PREFIX } from '../../constants';
+import { DEFAULT_BUNDLE_FILENAME, DEFAULT_BINDINGS_PREFIX, COMPONENT_ORIGINS } from '../../constants';
 import type { Results } from '../../specs-runner/specs-runner';
 import { Dependencies, Dependency } from '../../consumer/component/dependencies';
 import type { PathLinux } from '../../utils/path';
@@ -20,10 +16,11 @@ import type { TesterExtensionModel } from '../../extensions/tester-extension';
 import ExtensionFile from '../../extensions/extension-file';
 import { SourceFile } from '../../consumer/component/sources';
 import Repository from '../objects/repository';
-import type { RelativePath } from '../../consumer/component/dependencies/dependency';
 import VersionInvalid from '../exceptions/version-invalid';
 import logger from '../../logger/logger';
-import validateType from '../../utils/validate-type';
+import validateVersionInstance from '../version-validator';
+import type { ComponentOverridesData } from '../../consumer/config/component-overrides';
+import EnvExtension from '../../extensions/env-extension';
 
 type CiProps = {
   error: Object,
@@ -38,7 +35,7 @@ export type SourceFileModel = {
   file: Ref
 };
 
-type DistFileModel = SourceFileModel;
+export type DistFileModel = SourceFileModel;
 
 export type Log = {
   message: string,
@@ -57,16 +54,22 @@ export type VersionProps = {
   ci?: CiProps,
   specsResults?: ?Results,
   docs?: Doclet[],
-  dependencies?: BitIds,
-  devDependencies?: BitIds,
+  dependencies?: Dependency[],
+  devDependencies?: Dependency[],
+  compilerDependencies?: Dependency[],
+  testerDependencies?: Dependency[],
   flattenedDependencies?: BitIds,
   flattenedDevDependencies?: BitIds,
+  flattenedCompilerDependencies?: BitIds,
+  flattenedTesterDependencies?: BitIds,
   packageDependencies?: { [string]: string },
   devPackageDependencies?: { [string]: string },
   peerPackageDependencies?: { [string]: string },
-  envsPackageDependencies?: { [string]: string },
+  compilerPackageDependencies?: { [string]: string },
+  testerPackageDependencies?: { [string]: string },
   bindingPrefix?: string,
-  customResolvedPaths?: customResolvedPath[]
+  customResolvedPaths?: customResolvedPath[],
+  overrides: ComponentOverridesData
 };
 
 /**
@@ -84,62 +87,55 @@ export default class Version extends BitObject {
   docs: ?(Doclet[]);
   dependencies: Dependencies;
   devDependencies: Dependencies;
+  compilerDependencies: Dependencies;
+  testerDependencies: Dependencies;
   flattenedDependencies: BitIds;
   flattenedDevDependencies: BitIds;
+  flattenedCompilerDependencies: BitIds;
+  flattenedTesterDependencies: BitIds;
   packageDependencies: { [string]: string };
   devPackageDependencies: { [string]: string };
   peerPackageDependencies: { [string]: string };
-  envsPackageDependencies: { [string]: string };
+  compilerPackageDependencies: { [string]: string };
+  testerPackageDependencies: { [string]: string };
   bindingPrefix: ?string;
   customResolvedPaths: ?(customResolvedPath[]);
+  overrides: ComponentOverridesData;
 
-  constructor({
-    mainFile,
-    files,
-    dists,
-    compiler,
-    tester,
-    log,
-    dependencies,
-    devDependencies,
-    docs,
-    ci,
-    specsResults,
-    flattenedDependencies,
-    flattenedDevDependencies,
-    packageDependencies,
-    devPackageDependencies,
-    peerPackageDependencies,
-    envsPackageDependencies,
-    bindingPrefix,
-    customResolvedPaths
-  }: VersionProps) {
+  constructor(props: VersionProps) {
     super();
-    this.mainFile = mainFile;
-    this.files = files;
-    this.dists = dists;
-    this.compiler = compiler;
-    this.tester = tester;
-    this.log = log;
-    this.dependencies = new Dependencies(dependencies);
-    this.devDependencies = new Dependencies(devDependencies);
-    this.docs = docs;
-    this.ci = ci || {};
-    this.specsResults = specsResults;
-    this.flattenedDependencies = flattenedDependencies || new BitIds();
-    this.flattenedDevDependencies = flattenedDevDependencies || new BitIds();
-    this.packageDependencies = packageDependencies || {};
-    this.devPackageDependencies = devPackageDependencies || {};
-    this.peerPackageDependencies = peerPackageDependencies || {};
-    this.envsPackageDependencies = envsPackageDependencies || {};
-    this.bindingPrefix = bindingPrefix;
-    this.customResolvedPaths = customResolvedPaths;
+    this.mainFile = props.mainFile;
+    this.files = props.files;
+    this.dists = props.dists;
+    this.compiler = props.compiler;
+    this.tester = props.tester;
+    this.log = props.log;
+    this.dependencies = new Dependencies(props.dependencies);
+    this.devDependencies = new Dependencies(props.devDependencies);
+    this.compilerDependencies = new Dependencies(props.compilerDependencies);
+    this.testerDependencies = new Dependencies(props.testerDependencies);
+    this.docs = props.docs;
+    this.ci = props.ci || {};
+    this.specsResults = props.specsResults;
+    this.flattenedDependencies = props.flattenedDependencies || new BitIds();
+    this.flattenedDevDependencies = props.flattenedDevDependencies || new BitIds();
+    this.flattenedCompilerDependencies = props.flattenedCompilerDependencies || new BitIds();
+    this.flattenedTesterDependencies = props.flattenedTesterDependencies || new BitIds();
+    this.packageDependencies = props.packageDependencies || {};
+    this.devPackageDependencies = props.devPackageDependencies || {};
+    this.peerPackageDependencies = props.peerPackageDependencies || {};
+    this.compilerPackageDependencies = props.compilerPackageDependencies || {};
+    this.testerPackageDependencies = props.testerPackageDependencies || {};
+    this.bindingPrefix = props.bindingPrefix;
+    this.customResolvedPaths = props.customResolvedPaths;
+    this.overrides = props.overrides || {};
     this.validateVersion();
   }
 
   validateVersion() {
     const nonEmptyFields = ['mainFile', 'files'];
     nonEmptyFields.forEach((field) => {
+      // $FlowFixMe
       if (!this[field]) {
         throw new VersionInvalid(`failed creating a version object, the field "${field}" can't be empty`);
       }
@@ -150,9 +146,8 @@ export default class Version extends BitObject {
     const obj = this.toObject();
 
     // @todo: remove the entire dependencies.relativePaths from the ID (it's going to be a breaking change)
-    const getDependencies = (deps) => {
-      const clonedDependencies = R.clone(deps);
-      if (!clonedDependencies) return clonedDependencies;
+    const getDependencies = (deps: Dependencies) => {
+      const clonedDependencies = deps.cloneAsString();
       return clonedDependencies.map((dependency: Dependency) => {
         return {
           id: dependency.id,
@@ -169,9 +164,13 @@ export default class Version extends BitObject {
     const filterFunction = (val, key) => {
       if (
         key === 'devDependencies' ||
+        key === 'compilerDependencies' ||
+        key === 'testerDependencies' ||
         key === 'devPackageDependencies' ||
         key === 'peerPackageDependencies' ||
-        key === 'envsPackageDependencies'
+        key === 'compilerPackageDependencies' ||
+        key === 'testerPackageDependencies' ||
+        key === 'overrides'
       ) {
         return !R.isEmpty(val);
       }
@@ -186,33 +185,63 @@ export default class Version extends BitObject {
           compiler: obj.compiler,
           tester: obj.tester,
           log: obj.log,
-          dependencies: getDependencies(obj.dependencies),
-          devDependencies: getDependencies(obj.devDependencies),
+          dependencies: getDependencies(this.dependencies),
+          devDependencies: getDependencies(this.devDependencies),
+          compilerDependencies: getDependencies(this.compilerDependencies),
+          testerDependencies: getDependencies(this.testerDependencies),
           packageDependencies: obj.packageDependencies,
           devPackageDependencies: obj.devPackageDependencies,
           peerPackageDependencies: obj.peerPackageDependencies,
-          envsPackageDependencies: obj.envsPackageDependencies,
-          bindingPrefix: obj.bindingPrefix
+          compilerPackageDependencies: obj.compilerPackageDependencies,
+          testerPackageDependencies: obj.testerPackageDependencies,
+          bindingPrefix: obj.bindingPrefix,
+          overrides: obj.overrides
         },
         filterFunction
       )
     );
   }
 
-  getAllFlattenedDependencies() {
-    return this.flattenedDependencies.concat(this.flattenedDevDependencies);
+  getAllFlattenedDependencies(): BitIds {
+    return BitIds.fromArray([
+      ...this.flattenedDependencies,
+      ...this.flattenedDevDependencies,
+      ...this.flattenedCompilerDependencies,
+      ...this.flattenedTesterDependencies
+    ]);
   }
 
-  getAllDependencies() {
-    return this.dependencies.dependencies.concat(this.devDependencies.dependencies);
+  getAllDependencies(): Dependency[] {
+    return [
+      ...this.dependencies.dependencies,
+      ...this.devDependencies.dependencies,
+      ...this.compilerDependencies.dependencies,
+      ...this.testerDependencies.dependencies
+    ];
   }
 
-  collectDependencies(scope: Scope, withEnvironments?: boolean, dev?: boolean = false): Promise<ComponentVersion[]> {
-    const envDependencies = [this.compiler, this.tester];
-    const flattenedDependencies = dev ? this.flattenedDevDependencies : this.flattenedDependencies;
-    const dependencies = withEnvironments ? flattenedDependencies.concat(envDependencies) : flattenedDependencies;
-    const allDependencies = dependencies.concat(this.flattenedDevDependencies);
-    return scope.importManyOnes(allDependencies);
+  getAllDependenciesCloned(): Dependencies {
+    const dependencies = [
+      ...this.dependencies.getClone(),
+      ...this.devDependencies.getClone(),
+      ...this.compilerDependencies.getClone(),
+      ...this.testerDependencies.getClone()
+    ];
+    return new Dependencies(dependencies);
+  }
+
+  updateFlattenedDependency(currentId: BitId, newId: BitId) {
+    const getUpdated = (flattenedDependencies: BitIds): BitIds => {
+      const updatedIds = flattenedDependencies.map((depId) => {
+        if (depId.isEqual(currentId)) return newId;
+        return depId;
+      });
+      return BitIds.fromArray(updatedIds);
+    };
+    this.flattenedDependencies = getUpdated(this.flattenedDependencies);
+    this.flattenedDevDependencies = getUpdated(this.flattenedDevDependencies);
+    this.flattenedCompilerDependencies = getUpdated(this.flattenedCompilerDependencies);
+    this.flattenedTesterDependencies = getUpdated(this.flattenedTesterDependencies);
   }
 
   refs(): Ref[] {
@@ -273,15 +302,21 @@ export default class Version extends BitObject {
         ci: this.ci,
         specsResults: this.specsResults,
         docs: this.docs,
-        dependencies: this.dependencies.cloneAsString(),
-        devDependencies: this.devDependencies.cloneAsString(),
-        flattenedDependencies: this.flattenedDependencies.map(dep => dep.toString()),
-        flattenedDevDependencies: this.flattenedDevDependencies.map(dep => dep.toString()),
+        dependencies: this.dependencies.cloneAsObject(),
+        devDependencies: this.devDependencies.cloneAsObject(),
+        compilerDependencies: this.compilerDependencies.cloneAsObject(),
+        testerDependencies: this.testerDependencies.cloneAsObject(),
+        flattenedDependencies: this.flattenedDependencies.map(dep => dep.serialize()),
+        flattenedDevDependencies: this.flattenedDevDependencies.map(dep => dep.serialize()),
+        flattenedCompilerDependencies: this.flattenedCompilerDependencies.map(dep => dep.serialize()),
+        flattenedTesterDependencies: this.flattenedTesterDependencies.map(dep => dep.serialize()),
         packageDependencies: this.packageDependencies,
         devPackageDependencies: this.devPackageDependencies,
         peerPackageDependencies: this.peerPackageDependencies,
-        envsPackageDependencies: this.envsPackageDependencies,
-        customResolvedPaths: this.customResolvedPaths
+        compilerPackageDependencies: this.compilerPackageDependencies,
+        testerPackageDependencies: this.testerPackageDependencies,
+        customResolvedPaths: this.customResolvedPaths,
+        overrides: this.overrides
       },
       val => !!val
     );
@@ -317,19 +352,25 @@ export default class Version extends BitObject {
       ci,
       specsResults,
       dependencies,
-      flattenedDependencies,
       devDependencies,
+      compilerDependencies,
+      testerDependencies,
+      flattenedDependencies,
       flattenedDevDependencies,
+      flattenedCompilerDependencies,
+      flattenedTesterDependencies,
       devPackageDependencies,
       peerPackageDependencies,
-      envsPackageDependencies,
+      compilerPackageDependencies,
+      testerPackageDependencies,
       packageDependencies,
-      customResolvedPaths
+      customResolvedPaths,
+      overrides
     } = JSON.parse(contents);
-    const _getDependencies = (deps = []) => {
+    const _getDependencies = (deps = []): Dependency[] => {
       if (deps.length && R.is(String, first(deps))) {
         // backward compatibility
-        return deps.map(dependency => ({ id: BitId.parse(dependency) }));
+        return deps.map(dependency => ({ id: BitId.parseObsolete(dependency) }));
       }
 
       const getRelativePath = (relativePath) => {
@@ -348,12 +389,16 @@ export default class Version extends BitObject {
 
       return deps.map((dependency) => {
         return {
-          id: BitId.parse(dependency.id),
+          id: BitId.parseBackwardCompatible(dependency.id),
           relativePaths: Array.isArray(dependency.relativePaths)
             ? dependency.relativePaths.map(getRelativePath)
             : dependency.relativePaths
         };
       });
+    };
+
+    const _getFlattenedDependencies = (deps = []): BitIds => {
+      return BitIds.fromArray(deps.map(dep => BitId.parseBackwardCompatible(dep)));
     };
 
     const parseFile = (file) => {
@@ -382,14 +427,20 @@ export default class Version extends BitObject {
       specsResults,
       docs,
       dependencies: _getDependencies(dependencies),
-      flattenedDependencies: BitIds.deserialize(flattenedDependencies),
       devDependencies: _getDependencies(devDependencies),
-      flattenedDevDependencies: BitIds.deserialize(flattenedDevDependencies),
+      compilerDependencies: _getDependencies(compilerDependencies),
+      testerDependencies: _getDependencies(testerDependencies),
+      flattenedDependencies: _getFlattenedDependencies(flattenedDependencies),
+      flattenedDevDependencies: _getFlattenedDependencies(flattenedDevDependencies),
+      flattenedCompilerDependencies: _getFlattenedDependencies(flattenedCompilerDependencies),
+      flattenedTesterDependencies: _getFlattenedDependencies(flattenedTesterDependencies),
       devPackageDependencies,
       peerPackageDependencies,
-      envsPackageDependencies,
+      compilerPackageDependencies,
+      testerPackageDependencies,
       packageDependencies,
-      customResolvedPaths
+      customResolvedPaths,
+      overrides
     });
   }
 
@@ -397,10 +448,7 @@ export default class Version extends BitObject {
    * used by raw-object.toRealObject()
    */
   static from(versionProps: VersionProps): Version {
-    const compiler = versionProps.compiler ? parseEnv(versionProps.compiler) : null;
-    const tester = versionProps.tester ? parseEnv(versionProps.tester) : null;
-    const actualVersionProps = { ...versionProps, compiler, tester };
-    return new Version(actualVersionProps);
+    return Version.parse(JSON.stringify(versionProps));
   }
 
   /**
@@ -409,19 +457,25 @@ export default class Version extends BitObject {
    */
   static fromComponent({
     component,
+    versionFromModel,
     files,
     dists,
     flattenedDependencies,
     flattenedDevDependencies,
+    flattenedCompilerDependencies,
+    flattenedTesterDependencies,
     message,
     specsResults,
     username,
     email
   }: {
     component: ConsumerComponent,
-    files: ?Array<SourceFileModel>,
-    flattenedDependencies: BitId[],
-    flattenedDevDependencies: BitId[],
+    versionFromModel: Version,
+    files: Array<SourceFileModel>,
+    flattenedDependencies: BitIds,
+    flattenedDevDependencies: BitIds,
+    flattenedCompilerDependencies: BitIds,
+    flattenedTesterDependencies: BitIds,
     message: string,
     dists: ?Array<DistFileModel>,
     specsResults: ?Results,
@@ -437,26 +491,22 @@ export default class Version extends BitObject {
       };
     };
 
-    const mergePackageDependencies = (
-      envsPackageDependencies = {},
-      compilerDynamicPakageDependencies = {},
-      testerDynamicPakageDependencies = {}
-    ) => {
-      return { ...envsPackageDependencies, ...testerDynamicPakageDependencies, ...compilerDynamicPakageDependencies };
-    };
+    const compiler = component.compiler ? component.compiler.toModelObject() : undefined;
+    const tester = component.tester ? component.tester.toModelObject() : undefined;
 
     const compilerDynamicPakageDependencies = component.compiler
       ? component.compiler.dynamicPackageDependencies
       : undefined;
     const testerDynamicPakageDependencies = component.tester ? component.tester.dynamicPackageDependencies : undefined;
-
+    const compilerFromModel = R.path(['compiler'], versionFromModel);
+    const testerFromModel = R.path(['tester'], versionFromModel);
     return new Version({
       mainFile: component.mainFile,
-      files: files ? files.map(parseFile) : null,
+      files: files.map(parseFile),
       dists: dists ? dists.map(parseFile) : null,
-      compiler: component.compiler ? component.compiler.toModelObject() : undefined,
+      compiler,
       bindingPrefix: component.bindingPrefix,
-      tester: component.tester ? component.tester.toModelObject() : undefined,
+      tester,
       log: {
         message,
         username,
@@ -465,19 +515,27 @@ export default class Version extends BitObject {
       },
       specsResults,
       docs: component.docs,
+      dependencies: component.dependencies.get(),
+      devDependencies: component.devDependencies.get(),
+      compilerDependencies: component.compilerDependencies.get(),
+      testerDependencies: component.testerDependencies.get(),
       packageDependencies: component.packageDependencies,
       devPackageDependencies: component.devPackageDependencies,
       peerPackageDependencies: component.peerPackageDependencies,
-      envsPackageDependencies: mergePackageDependencies(
-        component.envsPackageDependencies,
-        compilerDynamicPakageDependencies,
-        testerDynamicPakageDependencies
-      ),
+      compilerPackageDependencies: {
+        ...component.compilerPackageDependencies,
+        ...compilerDynamicPakageDependencies
+      },
+      testerPackageDependencies: {
+        ...component.testerPackageDependencies,
+        ...testerDynamicPakageDependencies
+      },
       flattenedDependencies,
       flattenedDevDependencies,
-      dependencies: component.dependencies.get(),
-      devDependencies: component.devDependencies.get(),
-      customResolvedPaths: component.customResolvedPaths
+      flattenedCompilerDependencies,
+      flattenedTesterDependencies,
+      customResolvedPaths: component.customResolvedPaths,
+      overrides: component.overrides.componentOverridesData
     });
   }
 
@@ -506,149 +564,7 @@ export default class Version extends BitObject {
    * in the wrong format
    */
   validate(): void {
-    const message = 'unable to save Version object';
-    const validateBitIdStr = (bitIdStr: string, field: string, validateVersion: boolean = true) => {
-      validateType(message, bitIdStr, field, 'string');
-      let bitId;
-      try {
-        bitId = BitId.parse(bitIdStr);
-      } catch (err) {
-        throw new VersionInvalid(`${message}, the ${field} has an invalid Bit id`);
-      }
-      if (validateVersion && !bitId.hasVersion()) {
-        throw new VersionInvalid(`${message}, the ${field} ${bitIdStr} does not have a version`);
-      }
-      if (!bitId.scope) throw new VersionInvalid(`${message}, the ${field} ${bitIdStr} does not have a scope`);
-    };
-    const _validateEnv = (env) => {
-      if (!env) return;
-      if (typeof env === 'string') {
-        // Do not validate version - for backward compatibility
-        validateBitIdStr(env, 'environment-id', false);
-        return;
-      }
-      validateType(message, env, 'env', 'object');
-      if (!env.name) {
-        throw new VersionInvalid(`${message}, the environment is missing the name attribute`);
-      }
-      validateBitIdStr(env.name, 'env.name');
-      if (env.files) {
-        const compilerName = env.name || '';
-        env.files.forEach((file) => {
-          if (!file.name) {
-            throw new VersionInvalid(
-              `${message}, the environment ${compilerName} has a file which missing the name attribute`
-            );
-          }
-        });
-      }
-    };
-
-    /**
-     * Validate that the package name and version are valid
-     * @param {*} packageName
-     * @param {*} packageVersion
-     */
-    const _validatePackageDependency = (packageVersion, packageName) => {
-      const packageNameValidateResult = packageNameValidate(packageName);
-      if (!packageNameValidateResult.validForNewPackages && !packageNameValidateResult.validForOldPackages) {
-        const errors = packageNameValidateResult.errors || [];
-        throw new VersionInvalid(`${packageName} is invalid package name, errors:  ${errors.join()}`);
-      }
-      // don't use semver.valid and semver.validRange to validate the package version because it
-      // can be also a URL, Git URL or Github URL. see here: https://docs.npmjs.com/files/package.json#dependencies
-      validateType(message, packageVersion, `version of "${packageName}"`, 'string');
-    };
-    const _validatePackageDependencies = (packageDependencies) => {
-      validateType(message, packageDependencies, 'packageDependencies', 'object');
-      R.forEachObjIndexed(_validatePackageDependency, packageDependencies);
-    };
-    const validateFile = (file, isDist: boolean = false) => {
-      const field = isDist ? 'dist-file' : 'file';
-      validateType(message, file, field, 'object');
-      if (!isValidPath(file.relativePath)) {
-        throw new VersionInvalid(`${message}, the ${field} ${file.relativePath} is invalid`);
-      }
-      if (!file.name) {
-        throw new VersionInvalid(`${message}, the ${field} ${file.relativePath} is missing the name attribute`);
-      }
-      if (!file.file) throw new VersionInvalid(`${message}, the ${field} ${file.relativePath} is missing the hash`);
-      validateType(message, file.name, `${field}.name`, 'string');
-      validateType(message, file.file, `${field}.file`, 'object');
-      validateType(message, file.file.hash, `${field}.file.hash`, 'string');
-    };
-
-    if (!this.mainFile) throw new VersionInvalid(`${message}, the mainFile is missing`);
-    if (!isValidPath(this.mainFile)) throw new VersionInvalid(`${message}, the mainFile ${this.mainFile} is invalid`);
-    if (!this.files || !this.files.length) throw new VersionInvalid(`${message}, the files are missing`);
-    let foundMainFile = false;
-    validateType(message, this.files, 'files', 'array');
-    const filesPaths = [];
-    this.files.forEach((file) => {
-      validateFile(file);
-      filesPaths.push(file.relativePath);
-      if (file.relativePath === this.mainFile) foundMainFile = true;
-    });
-    if (!foundMainFile) {
-      throw new VersionInvalid(`${message}, unable to find the mainFile ${this.mainFile} in the files list`);
-    }
-    const duplicateFiles = filesPaths.filter(
-      file => filesPaths.filter(f => file.toLowerCase() === f.toLowerCase()).length > 1
-    );
-    if (duplicateFiles.length) {
-      throw new VersionInvalid(`${message} the following files are duplicated ${duplicateFiles.join(', ')}`);
-    }
-    _validateEnv(this.compiler);
-    _validateEnv(this.tester);
-    _validatePackageDependencies(this.packageDependencies);
-    _validatePackageDependencies(this.devPackageDependencies);
-    _validatePackageDependencies(this.peerPackageDependencies);
-    _validatePackageDependencies(this.envsPackageDependencies);
-    if (this.dists && this.dists.length) {
-      validateType(message, this.dists, 'dist', 'array');
-      // $FlowFixMe
-      this.dists.forEach((file) => {
-        validateFile(file, true);
-      });
-    }
-    if (!(this.dependencies instanceof Dependencies)) {
-      throw new VersionInvalid(
-        `${message}, dependencies must be an instance of Dependencies, got ${typeof this.dependencies}`
-      );
-    }
-    if (!(this.devDependencies instanceof Dependencies)) {
-      throw new VersionInvalid(
-        `${message}, devDependencies must be an instance of Dependencies, got ${typeof this.devDependencies}`
-      );
-    }
-    this.dependencies.validate();
-    this.devDependencies.validate();
-    if (!this.dependencies.isEmpty() && !this.flattenedDependencies.length) {
-      throw new VersionInvalid(`${message}, it has dependencies but its flattenedDependencies is empty`);
-    }
-    if (!this.devDependencies.isEmpty() && !this.flattenedDevDependencies.length) {
-      throw new VersionInvalid(`${message}, it has devDependencies but its flattenedDevDependencies is empty`);
-    }
-    const validateFlattenedDependencies = (dependencies: string[]) => {
-      validateType(message, dependencies, 'dependencies', 'array');
-      dependencies.forEach((dependency) => {
-        if (!(dependency instanceof BitId)) {
-          throw new VersionInvalid(`${message}, a flattenedDependency expected to be BitId, got ${typeof dependency}`);
-        }
-        if (!dependency.hasVersion()) {
-          throw new VersionInvalid(
-            `${message}, the flattenedDependency ${dependency.toString()} does not have a version`
-          );
-        }
-      });
-    };
-    validateFlattenedDependencies(this.flattenedDependencies);
-    validateFlattenedDependencies(this.flattenedDevDependencies);
-    if (!this.log) throw new VersionInvalid(`${message}, the log object is missing`);
-    validateType(message, this.log, 'log', 'object');
-    if (this.bindingPrefix) {
-      validateType(message, this.bindingPrefix, 'bindingPrefix', 'string');
-    }
+    validateVersionInstance(this);
   }
 }
 
@@ -672,4 +588,15 @@ const envNameOnly = (env) => {
     return true;
   }
   return false;
+};
+
+const getEnvModelOrName = (env) => {
+  if (typeof env === 'string') {
+    return env;
+  }
+  // Store the env as string in case there is no config and files (for backward compatibility)
+  if (envNameOnly(env)) {
+    return env.name;
+  }
+  return env;
 };

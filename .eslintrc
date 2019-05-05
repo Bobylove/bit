@@ -5,6 +5,7 @@
     "flowtype-errors"
   ],
   "rules": {
+    "no-bitwise": "off",
     "arrow-body-style": [0, "as-needed"],
     "camelcase": [0],
     "no-trailing-spaces": [0],
@@ -34,7 +35,7 @@
       "ignoreStrings": true,
       "ignoreTemplateLiterals": true
     }],
-    "max-lines": [2, 1000],
+    "max-lines": [2, 1700],
     "func-names": [0]
   },
   "env": {

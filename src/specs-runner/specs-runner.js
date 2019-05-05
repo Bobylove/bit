@@ -8,10 +8,11 @@ import type { ForkLevel } from '../api/consumer/lib/test';
 import { TESTS_FORK_LEVEL } from '../constants';
 import { Analytics } from '../analytics/analytics';
 import logger from '../logger/logger';
-import ExternalError from '../error/external-error';
-import ExternalBuildError from '../consumer/component/exceptions/external-build-error';
-import ExternalTestError from '../consumer/component/exceptions/external-test-error';
+import ExternalErrors from '../error/external-errors';
+import ExternalBuildErrors from '../consumer/component/exceptions/external-build-errors';
+import ExternalTestErrors from '../consumer/component/exceptions/external-test-errors';
 import type { SpecsResultsWithComponentId } from '../consumer/specs-results/specs-results';
+import { BitId } from '../bit-id';
 
 export type Tester = {
   run: (filePath: string) => Promise<Results>,
@@ -146,15 +147,21 @@ function deserializeResults(
   if (results.type === 'error') {
     let deserializedError = deserializeError(results.error);
     // Special desrialization for external errors
+    if (deserializedError.originalErrors) {
+      const deserializedOriginalErrors = deserializedError.originalErrors.map(deserializeError);
+      if (results.error.name === ExternalBuildErrors.name) {
+        deserializedError = new ExternalBuildErrors(deserializedError.id, deserializedOriginalErrors);
+      } else if (results.error.name === ExternalTestErrors.name) {
+        deserializedError = new ExternalTestErrors(deserializedError.id, deserializedOriginalErrors);
+      } else {
+        deserializedError = new ExternalErrors(deserializedOriginalErrors);
+      }
+    }
     if (deserializedError.originalError) {
       const deserializedOriginalError = deserializeError(deserializedError.originalError);
-      if (results.error.name === ExternalBuildError.name) {
-        deserializedError = new ExternalBuildError(deserializedOriginalError, deserializedError.id);
-      } else if (results.error.name === ExternalTestError.name) {
-        deserializedError = new ExternalTestError(deserializedOriginalError, deserializedError.id);
-      } else {
-        deserializedError = new ExternalError(deserializedOriginalError);
-      }
+      const compName =
+        deserializedError.compName && typeof deserializedError.compName === 'string' ? deserializedError.compName : '';
+      deserializedError = new ExternalTestErrors(compName, [deserializedOriginalError]);
     }
     const finalResults = {
       type: 'error',
@@ -176,6 +183,7 @@ function deserializeResults(
   };
 
   const deserializeResult = (result) => {
+    result.componentId = new BitId(result.componentId); // when BitId is received from a fork it loses its class and appears as an object
     if (!result.failures) return result;
     result.failures = result.failures.map(deserializeFailure);
     return result;

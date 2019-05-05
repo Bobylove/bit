@@ -4,9 +4,10 @@ import Command from '../../command';
 import { getConsumerComponent, getScopeComponent } from '../../../api/consumer';
 import paintComponent from '../../templates/component-template';
 import ConsumerComponent from '../../../consumer/component';
-import { BitId } from '../../../bit-id';
 import { BASE_DOCS_DOMAIN } from '../../../constants';
 import GeneralError from '../../../error/general-error';
+import { BEFORE_SHOW_REMOTE } from '../../../cli/loader/loader-messages';
+import loader from '../../../cli/loader';
 
 export default class Show extends Command {
   name = 'show <id>';
@@ -14,9 +15,11 @@ export default class Show extends Command {
   alias = '';
   opts = [
     ['j', 'json', 'return a json version of the component'],
+    ['r', 'remote', 'show a remote component'],
     ['v', 'versions', 'return a json of all the versions of the component'],
     ['o', 'outdated', 'show latest version from the remote scope (if exists)'],
-    ['c', 'compare [boolean]', 'compare current file system component to latest tagged component [default=latest]']
+    ['c', 'compare [boolean]', 'compare current file system component to latest tagged component [default=latest]'],
+    ['d', 'detailed', 'show more details']
   ];
   loader = true;
   migration = true;
@@ -26,14 +29,25 @@ export default class Show extends Command {
     {
       json,
       versions,
+      remote = false,
       outdated = false,
-      compare = false
-    }: { json?: boolean, versions: ?boolean, outdated?: boolean, compare?: boolean }
+      compare = false,
+      detailed = false
+    }: {
+      json?: boolean,
+      versions: ?boolean,
+      remote: boolean,
+      outdated?: boolean,
+      compare?: boolean,
+      detailed?: boolean
+    }
   ): Promise<*> {
     function getBitComponent(allVersions: ?boolean) {
-      const bitId = BitId.parse(id);
-      if (bitId.isLocal()) return getConsumerComponent({ id, compare, allVersions, showRemoteVersions: outdated });
-      return getScopeComponent({ id, allVersions, showRemoteVersions: outdated });
+      if (remote) {
+        loader.start(BEFORE_SHOW_REMOTE);
+        return getScopeComponent({ id, allVersions, showRemoteVersions: outdated }).then(component => ({ component }));
+      }
+      return getConsumerComponent({ id, compare, allVersions, showRemoteVersions: outdated });
     }
 
     if (versions && (compare || outdated)) {
@@ -53,7 +67,8 @@ export default class Show extends Command {
       component,
       componentModel,
       json,
-      outdated
+      outdated,
+      detailed
     }));
   }
 
@@ -63,14 +78,16 @@ export default class Show extends Command {
     json,
     versions,
     components,
-    outdated
+    outdated,
+    detailed
   }: {
     component: ?ConsumerComponent,
     componentModel?: ConsumerComponent,
     json: ?boolean,
     versions: ?boolean,
     components: ?(ConsumerComponent[]),
-    outdated: boolean
+    outdated: boolean,
+    detailed: boolean
   }): string {
     if (versions) {
       if (R.isNil(components) || R.isEmpty(components)) {
@@ -110,6 +127,6 @@ export default class Show extends Command {
       const jsonObject = componentFromModel ? { componentFromFileSystem, componentFromModel } : componentFromFileSystem;
       return JSON.stringify(jsonObject, null, '  ');
     }
-    return paintComponent(component, componentModel, outdated);
+    return paintComponent(component, componentModel, outdated, detailed);
   }
 }

@@ -1,5 +1,6 @@
 // @flow
 import path from 'path';
+import format from 'string-format';
 import fs from 'fs-extra';
 import R from 'ramda';
 import json from 'comment-json';
@@ -11,20 +12,29 @@ import {
   COMPONENT_ORIGINS,
   DEFAULT_SEPARATOR,
   DEFAULT_INDEX_EXTS,
-  BIT_VERSION
+  BIT_VERSION,
+  VERSION_DELIMITER,
+  COMPILER_ENV_TYPE,
+  TESTER_ENV_TYPE,
+  COMPONENT_DIR
 } from '../../constants';
 import { InvalidBitMap, MissingMainFile, MissingBitMapComponent } from './exceptions';
 import { BitId, BitIds } from '../../bit-id';
-import { outputFile, pathNormalizeToLinux, pathJoinLinux, isDir, pathIsInside } from '../../utils';
+import { outputFile, pathNormalizeToLinux, pathJoinLinux, isDir, pathIsInside, stripTrailingChar } from '../../utils';
 import ComponentMap from './component-map';
 import type { ComponentMapFile, ComponentOrigin, PathChange } from './component-map';
 import type { PathLinux, PathOsBased, PathOsBasedRelative, PathOsBasedAbsolute, PathRelative } from '../../utils/path';
 import type { BitIdStr } from '../../bit-id/bit-id';
 import GeneralError from '../../error/general-error';
+import InvalidConfigDir from './exceptions/invalid-config-dir';
+import ComponentConfig from '../config';
+import ConfigDir from './config-dir';
+import WorkspaceConfig from '../config/workspace-config';
 
 export type BitMapComponents = { [componentId: string]: ComponentMap };
 
-export type PathChangeResult = { id: string, changes: PathChange[] };
+export type PathChangeResult = { id: BitId, changes: PathChange[] };
+export type IgnoreFilesDirs = { files: PathLinux[], dirs: PathLinux[] };
 
 export default class BitMap {
   projectRoot: string;
@@ -32,17 +42,21 @@ export default class BitMap {
   components: BitMapComponents;
   hasChanged: boolean;
   version: string;
-  paths: { [path: string]: string }; // path => componentId
-  pathsLowerCase: { [path: string]: string }; // path => componentId
+  paths: { [path: string]: BitId }; // path => componentId
+  pathsLowerCase: { [path: string]: BitId }; // path => componentId
+  markAsChangedBinded: Function;
+  allIds: ?BitIds;
+  allTrackDirs: ?{ [trackDir: PathLinux]: BitId };
 
-  constructor(projectRoot: string, mapPath: string, components: BitMapComponents, version: string) {
+  constructor(projectRoot: string, mapPath: string, version: string) {
     this.projectRoot = projectRoot;
     this.mapPath = mapPath;
-    this.components = components;
+    this.components = {};
     this.hasChanged = false;
     this.version = version;
     this.paths = {};
     this.pathsLowerCase = {};
+    this.markAsChangedBinded = this.markAsChanged.bind(this);
   }
 
   markAsChanged() {
@@ -50,58 +64,86 @@ export default class BitMap {
     this._invalidateCache();
   }
 
-  setComponent(id: string, componentMap: ComponentMap) {
-    const bitId = BitId.parse(id);
+  setComponent(bitId: BitId, componentMap: ComponentMap) {
+    const id = bitId.toString();
     if (!bitId.hasVersion() && bitId.scope) {
       throw new GeneralError(`invalid bitmap id ${id}, a component must have a version when a scope-name is included`);
     }
-    const idWithoutScopeAndVersion = bitId.toStringWithoutScopeAndVersion();
     if (componentMap.origin !== COMPONENT_ORIGINS.NESTED) {
-      // make sure there are no duplications (same namespace+name)
-      Object.keys(this.components).forEach((compId) => {
-        if (
-          BitId.parse(compId).toStringWithoutScopeAndVersion() === idWithoutScopeAndVersion &&
-          this.components[compId].origin !== COMPONENT_ORIGINS.NESTED
-        ) {
-          throw new GeneralError(`your id ${id} is duplicated with ${compId}`);
-        }
-      });
+      // make sure there are no duplications (same name)
+      const similarIds = this.findSimilarIds(bitId, true);
+      if (similarIds.length) {
+        throw new GeneralError(`your id ${id} is duplicated with ${similarIds.toString()}`);
+      }
     }
 
+    componentMap.id = bitId;
     this.components[id] = componentMap;
     this.markAsChanged();
   }
 
+  setComponentProp(id: BitId, propName: $Keys<ComponentMap>, val: any) {
+    const componentMap = this.getComponent(id, { ignoreScopeAndVersion: true });
+    // $FlowFixMe
+    componentMap[propName] = val;
+    this.markAsChanged();
+    return componentMap;
+  }
+
+  isEmpty() {
+    return R.isEmpty(this.components);
+  }
+
+  removeComponentProp(id: BitId, propName: $Keys<ComponentMap>) {
+    const componentMap = this.getComponent(id, { ignoreScopeAndVersion: true });
+    // $FlowFixMe
+    delete componentMap[propName];
+    this.markAsChanged();
+    return componentMap;
+  }
+
   static load(dirPath: PathOsBasedAbsolute): BitMap {
-    const standardLocation = path.join(dirPath, BIT_MAP);
-    const oldLocation = path.join(dirPath, OLD_BIT_MAP);
-    const getBitMapLocation = (): ?PathOsBased => {
-      if (fs.existsSync(standardLocation)) return standardLocation;
-      if (fs.existsSync(oldLocation)) return oldLocation;
-      return null;
-    };
-    const bitMapLocation = getBitMapLocation();
-    const components = {};
-    if (!bitMapLocation) {
-      logger.info(`bit.map: unable to find an existing ${BIT_MAP} file. Will create a new one if needed`);
-      return new BitMap(dirPath, standardLocation, components, BIT_VERSION);
+    const { currentLocation, defaultLocation } = BitMap.getBitMapLocation(dirPath);
+    const mapFileContent = BitMap.loadRawSync(dirPath);
+    if (!mapFileContent || !currentLocation) {
+      return new BitMap(dirPath, defaultLocation, BIT_VERSION);
     }
-    const mapFileContent = fs.readFileSync(bitMapLocation);
     let componentsJson;
     try {
       componentsJson = json.parse(mapFileContent.toString('utf8'), null, true);
     } catch (e) {
       logger.error(e);
-      throw new InvalidBitMap(bitMapLocation, e.message);
+      throw new InvalidBitMap(currentLocation, e.message);
     }
     const version = componentsJson.version;
     // Don't treat version like component
     delete componentsJson.version;
-    Object.keys(componentsJson).forEach((componentId) => {
-      components[componentId] = ComponentMap.fromJson(componentsJson[componentId]);
-    });
 
-    return new BitMap(dirPath, bitMapLocation, components, version);
+    const bitMap = new BitMap(dirPath, currentLocation, version);
+    bitMap.loadComponents(componentsJson);
+    return bitMap;
+  }
+
+  static loadRawSync(dirPath: PathOsBasedAbsolute): ?Buffer {
+    const { currentLocation } = BitMap.getBitMapLocation(dirPath);
+    if (!currentLocation) {
+      logger.info(`bit.map: unable to find an existing ${BIT_MAP} file. Will create a new one if needed`);
+      return undefined;
+    }
+    const mapFileContent = fs.readFileSync(currentLocation);
+    return mapFileContent;
+  }
+
+  static getBitMapLocation(dirPath: PathOsBasedAbsolute) {
+    const defaultLocation = path.join(dirPath, BIT_MAP);
+    const oldLocation = path.join(dirPath, OLD_BIT_MAP);
+    const getCurrentLocation = (): ?PathOsBased => {
+      if (fs.existsSync(defaultLocation)) return defaultLocation;
+      if (fs.existsSync(oldLocation)) return oldLocation;
+      return null;
+    };
+    const currentLocation = getCurrentLocation();
+    return { currentLocation, defaultLocation };
   }
 
   /**
@@ -129,6 +171,87 @@ export default class BitMap {
     }
   }
 
+  /**
+   * Return files and dirs which need to be ignored since they are config files / dirs
+   * @param {*} configDir
+   * @param {*} rootDir
+   * @param {*} compilerFilesPaths
+   * @param {*} testerFilesPaths
+   */
+  static resolveIgnoreFilesAndDirs(
+    configDir?: PathLinux,
+    rootDir: PathLinux,
+    compilerFilesPaths: PathLinux[] = [],
+    testerFilesPaths: PathLinux[] = []
+  ) {
+    const ignoreList = {
+      files: [],
+      dirs: []
+    };
+    if (!configDir) return ignoreList;
+    if (configDir.startsWith(`{${COMPONENT_DIR}}`)) {
+      const resolvedConfigDir = format(configDir, { [COMPONENT_DIR]: rootDir, ENV_TYPE: '' });
+      const allEnvFilesPaths = compilerFilesPaths.concat(testerFilesPaths);
+      allEnvFilesPaths.forEach((file) => {
+        const ignoreFile = pathJoinLinux(resolvedConfigDir, file);
+        ignoreList.files.push(ignoreFile);
+      });
+      const configDirWithoutCompDir = format(configDir, { [COMPONENT_DIR]: '', ENV_TYPE: '{ENV_TYPE}' });
+      // There is nested folders to ignore
+      if (configDirWithoutCompDir !== '' && configDirWithoutCompDir !== '/') {
+        const configDirWithoutCompAndEnvsDir = format(configDir, { [COMPONENT_DIR]: '', ENV_TYPE: '' });
+        // There is nested folder which is not the env folders - ignore it completely
+        if (configDirWithoutCompAndEnvsDir !== '' && configDirWithoutCompAndEnvsDir !== '/') {
+          const resolvedDirWithoutEnvType = format(configDir, { [COMPONENT_DIR]: rootDir, ENV_TYPE: '' });
+          ignoreList.dirs.push(stripTrailingChar(resolvedDirWithoutEnvType, '/'));
+        } else {
+          const resolvedCompilerConfigDir = format(configDir, {
+            [COMPONENT_DIR]: rootDir,
+            ENV_TYPE: COMPILER_ENV_TYPE
+          });
+          const resolvedTesterConfigDir = format(configDir, { [COMPONENT_DIR]: rootDir, ENV_TYPE: TESTER_ENV_TYPE });
+          ignoreList.dirs.push(resolvedCompilerConfigDir, resolvedTesterConfigDir);
+        }
+      }
+    } else {
+      // Ignore the whole dir since this dir is only for config files
+      const dirToIgnore = format(configDir, { ENV_TYPE: '' });
+      ignoreList.dirs.push(dirToIgnore);
+    }
+    return ignoreList;
+  }
+
+  /**
+   * this is a temporarily method until ConfigDir class is merged into master
+   */
+  static parseConfigDir(configDir: ConfigDir, rootDir: string) {
+    const configDirResolved = {};
+    configDirResolved.compiler = configDir.getResolved({
+      componentDir: rootDir,
+      envType: COMPILER_ENV_TYPE
+    }).linuxDirPath;
+    configDirResolved.tester = configDir.getResolved({ componentDir: rootDir, envType: TESTER_ENV_TYPE }).linuxDirPath;
+    return configDirResolved;
+  }
+
+  loadComponents(componentsJson: Object) {
+    Object.keys(componentsJson).forEach((componentId) => {
+      const componentFromJson = componentsJson[componentId];
+      const idHasScope = (): boolean => {
+        if (componentFromJson.origin !== COMPONENT_ORIGINS.AUTHORED) return true;
+        if ('exported' in componentFromJson) {
+          return componentFromJson.exported;
+        }
+        // backward compatibility
+        return BitId.parseObsolete(componentId).hasScope();
+      };
+      componentFromJson.id = BitId.parse(componentId, idHasScope());
+      const componentMap = ComponentMap.fromJson(componentsJson[componentId]);
+      componentMap.setMarkAsChangedCb(this.markAsChangedBinded);
+      this.components[componentId] = componentMap;
+    });
+  }
+
   getAllComponents(origin?: ComponentOrigin | ComponentOrigin[]): BitMapComponents {
     if (!origin) return this.components;
     const isOriginMatch = component => component.origin === origin;
@@ -138,15 +261,210 @@ export default class BitMap {
     return R.filter(filter, this.components);
   }
 
-  getAuthoredExportedComponents(): BitId[] {
-    const componentsIds = [];
-    Object.keys(this.components).forEach((componentId) => {
-      if (this.components[componentId].origin === COMPONENT_ORIGINS.AUTHORED) {
-        const idParsed = BitId.parse(componentId);
-        if (idParsed.scope) componentsIds.push(idParsed);
+  /**
+   * We should ignore ejected config files and dirs
+   * Files might be on the root dir then we need to ignore them directly by taking them from the bit.json
+   * They might be in internal dirs then we need to ignore the dir completely
+   */
+  async getConfigDirsAndFilesToIgnore(
+    consumerPath: PathLinux,
+    consumerConfig: WorkspaceConfig
+  ): Promise<IgnoreFilesDirs> {
+    const ignoreList = {
+      files: [],
+      dirs: []
+    };
+    const populateIgnoreListP = R.values(this.components).map(async (component: ComponentMap) => {
+      const configDir = component.configDir;
+      const componentDir = component.getComponentDir();
+      if (configDir && componentDir) {
+        const resolvedBaseConfigDir = component.getBaseConfigDir() || '';
+        const fullConfigDir = path.join(consumerPath, resolvedBaseConfigDir);
+        const componentPkgJsonDir = component.rootDir ? path.join(consumerPath, component.rootDir) : null;
+        const componentConfig = await ComponentConfig.load(componentPkgJsonDir, fullConfigDir, consumerConfig);
+        const compilerObj = R.values(componentConfig.compiler)[0];
+        const compilerFilesObj = compilerObj && compilerObj.files ? compilerObj.files : undefined;
+        const testerObj = R.values(componentConfig.tester)[0];
+        const testerFilesObj = testerObj && testerObj.files ? testerObj.files : undefined;
+        const compilerFiles = compilerFilesObj ? R.values(compilerFilesObj) : [];
+        const testerFiles = testerFilesObj ? R.values(testerFilesObj) : [];
+        // R.values above might return array of something which is not string
+        // Which will not be ok with the input of resolveIgnoreFilesAndDirs
+        const toIgnore = BitMap.resolveIgnoreFilesAndDirs(
+          configDir.linuxDirPath,
+          componentDir,
+          // $FlowFixMe - see comment above
+          compilerFiles,
+          // $FlowFixMe - see comment above
+          testerFiles
+        );
+        ignoreList.files = ignoreList.files.concat(toIgnore.files);
+        ignoreList.dirs = ignoreList.dirs.concat(toIgnore.dirs);
       }
     });
-    return componentsIds;
+    await Promise.all(populateIgnoreListP);
+    return ignoreList;
+  }
+
+  getAllBitIds(origin?: ComponentOrigin[]): BitIds {
+    if (!origin && this.allIds) return this.allIds;
+    const allComponents = R.values(this.components);
+    const ids = (componentMaps: ComponentMap[]) => BitIds.fromArray(componentMaps.map(c => c.id));
+    if (!origin) {
+      this.allIds = ids(allComponents);
+      return this.allIds;
+    }
+    // $FlowFixMe we know origin is an array in that case
+    const components = allComponents.filter(c => origin.includes(c.origin));
+    return ids(components);
+  }
+
+  /**
+   * get existing bitmap bit-id by bit-id.
+   * throw an exception if not found
+   * @see also getBitIdIfExist
+   */
+  getBitId(
+    bitId: BitId,
+    {
+      ignoreVersion = false,
+      ignoreScopeAndVersion = false
+    }: {
+      ignoreVersion?: boolean,
+      ignoreScopeAndVersion?: boolean
+    } = {}
+  ): BitId {
+    if (!(bitId instanceof BitId)) {
+      throw new TypeError(`BitMap.getBitId expects bitId to be an instance of BitId, instead, got ${bitId}`);
+    }
+    const allIds = this.getAllBitIds();
+    const exactMatch = allIds.search(bitId);
+    if (exactMatch) return exactMatch;
+    if (ignoreVersion) {
+      const matchWithoutVersion = allIds.searchWithoutVersion(bitId);
+      if (matchWithoutVersion) return matchWithoutVersion;
+    }
+    if (ignoreScopeAndVersion) {
+      const matchWithoutScopeAndVersion = allIds.searchWithoutScopeAndVersion(bitId);
+      if (matchWithoutScopeAndVersion) return matchWithoutScopeAndVersion;
+    }
+    throw new MissingBitMapComponent(bitId.toString());
+  }
+
+  /**
+   * get existing bitmap bit-id by bit-id
+   * don't throw an exception if not found
+   * @see also getBitId
+   */
+  getBitIdIfExist(
+    bitId: BitId,
+    {
+      ignoreVersion = false,
+      ignoreScopeAndVersion = false
+    }: {
+      ignoreVersion?: boolean,
+      ignoreScopeAndVersion?: boolean
+    } = {}
+  ): ?BitId {
+    try {
+      const existingBitId = this.getBitId(bitId, { ignoreVersion, ignoreScopeAndVersion });
+      return existingBitId;
+    } catch (err) {
+      if (err instanceof MissingBitMapComponent) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * get componentMap from bitmap by bit-id.
+   * throw an exception if not found.
+   * @see also getComponentIfExist
+   */
+  getComponent(
+    bitId: BitId,
+    {
+      ignoreVersion = false,
+      ignoreScopeAndVersion = false
+    }: {
+      ignoreVersion?: boolean,
+      ignoreScopeAndVersion?: boolean
+    } = {}
+  ): ComponentMap {
+    const existingBitId: BitId = this.getBitId(bitId, { ignoreVersion, ignoreScopeAndVersion });
+    return this.components[existingBitId.toString()];
+  }
+
+  /**
+   * get componentMap from bitmap by bit-id
+   * don't throw an exception if not found
+   * @see also getComponent
+   */
+  getComponentIfExist(
+    bitId: BitId,
+    {
+      ignoreVersion = false,
+      ignoreScopeAndVersion = false
+    }: {
+      ignoreVersion?: boolean,
+      ignoreScopeAndVersion?: boolean
+    } = {}
+  ): ?ComponentMap {
+    try {
+      const componentMap = this.getComponent(bitId, { ignoreVersion, ignoreScopeAndVersion });
+      return componentMap;
+    } catch (err) {
+      if (err instanceof MissingBitMapComponent) return null;
+      throw err;
+    }
+  }
+
+  getNonNestedComponentIfExist(bitId: BitId): ?ComponentMap {
+    const nonNestedIds = this.getAllBitIds([COMPONENT_ORIGINS.IMPORTED, COMPONENT_ORIGINS.AUTHORED]);
+    const id: ?BitId = nonNestedIds.searchWithoutScopeAndVersion(bitId);
+    if (!id) return null;
+    return this.getComponent(id);
+  }
+
+  getComponentPreferNonNested(bitId: BitId): ?ComponentMap {
+    return this.getNonNestedComponentIfExist(bitId) || this.getComponentIfExist(bitId, { ignoreVersion: true });
+  }
+
+  getAuthoredAndImportedBitIds(): BitIds {
+    return this.getAllBitIds([COMPONENT_ORIGINS.AUTHORED, COMPONENT_ORIGINS.IMPORTED]);
+  }
+
+  getAuthoredExportedComponents(): BitId[] {
+    const authoredIds = this.getAllBitIds([COMPONENT_ORIGINS.AUTHORED]);
+    return authoredIds.filter(id => id.hasScope());
+  }
+
+  validateConfigDir(compId: string, configDir: PathLinux): boolean {
+    const components = this.getAllComponents();
+    if (configDir.startsWith('./')) {
+      configDir = configDir.replace('./', '');
+    }
+    const comps = R.pickBy((component) => {
+      const compDir = component.getComponentDir();
+      if (compDir && pathIsInside(configDir, compDir)) {
+        return true;
+      }
+      const compConfigDir =
+        component.configDir && component.configDir instanceof ConfigDir
+          ? component.configDir.getResolved({ componentDir: compDir || '' }).getEnvTypeCleaned().linuxDirPath
+          : null;
+      if (compConfigDir && pathIsInside(configDir, compConfigDir)) {
+        return true;
+      }
+      return false;
+    }, components);
+    if (!R.isEmpty(comps)) {
+      const id = R.keys(comps)[0];
+      const stringId = BitId.parse(id).toStringWithoutVersion();
+      if (compId !== stringId) {
+        throw new InvalidConfigDir(stringId);
+      }
+    }
+    return true;
   }
 
   _makePathRelativeToProjectRoot(pathToChange: PathRelative): PathOsBasedRelative {
@@ -154,10 +472,14 @@ export default class BitMap {
     return path.relative(this.projectRoot, absolutePath);
   }
 
-  _searchMainFile(baseMainFile: string, files: ComponentMapFile[]): ?PathLinux {
+  _searchMainFile(baseMainFile: string, files: ComponentMapFile[], rootDir: ?PathLinux): ?PathLinux {
     // search for an exact relative-path
     let mainFileFromFiles = files.find(file => file.relativePath === baseMainFile);
     if (mainFileFromFiles) return baseMainFile;
+    if (rootDir) {
+      const mainFileUsingRootDir = files.find(file => pathJoinLinux(rootDir, file.relativePath) === baseMainFile);
+      if (mainFileUsingRootDir) return mainFileUsingRootDir.relativePath;
+    }
     // search for a file-name
     const potentialMainFiles = files.filter(file => file.name === baseMainFile);
     if (!potentialMainFiles.length) return null;
@@ -169,13 +491,14 @@ export default class BitMap {
     return mainFileFromFiles.relativePath;
   }
 
-  _getMainFile(mainFile?: PathLinux, componentMap: ComponentMap): PathLinux {
+  _getMainFile(mainFile?: PathLinux, componentIdStr: string): PathLinux {
+    const componentMap: ComponentMap = this.components[componentIdStr];
     const files = componentMap.files.filter(file => !file.test);
     // scenario 1) user entered mainFile => search the mainFile in the files array
     if (mainFile) {
-      const foundMainFile = this._searchMainFile(mainFile, files);
+      const foundMainFile = this._searchMainFile(mainFile, files, componentMap.rootDir);
       if (foundMainFile) return foundMainFile;
-      throw new MissingMainFile(mainFile, files.map(file => path.normalize(file.relativePath)));
+      throw new MissingMainFile(componentIdStr, mainFile, files.map(file => path.normalize(file.relativePath)));
     }
     // scenario 2) user didn't enter mainFile and the component has only one file => use that file as the main file.
     if (files.length === 1) return files[0].relativePath;
@@ -185,12 +508,12 @@ export default class BitMap {
       // TODO: can be improved - stop loop if finding main file
       if (!searchResult) {
         const mainFileNameToSearch = `${DEFAULT_INDEX_NAME}.${ext}`;
-        searchResult = this._searchMainFile(mainFileNameToSearch, files);
+        searchResult = this._searchMainFile(mainFileNameToSearch, files, componentMap.rootDir);
       }
     });
     if (searchResult) return searchResult;
     const mainFileString = `${DEFAULT_INDEX_NAME}.[${DEFAULT_INDEX_EXTS.join(', ')}]`;
-    throw new MissingMainFile(mainFileString, files.map(file => path.normalize(file.relativePath)));
+    throw new MissingMainFile(componentIdStr, mainFileString, files.map(file => path.normalize(file.relativePath)));
   }
 
   addDependencyToParent(parent: BitId, dependency: string): void {
@@ -204,7 +527,9 @@ export default class BitMap {
     } else if (this.components[parentWithoutScope]) {
       parentId = parentWithoutScope;
     } else {
-      throw new GeneralError(`Unable to add indirect dependency ${dependency}, as its parent ${parent} does not exist`);
+      throw new GeneralError(
+        `Unable to add indirect dependency ${dependency}, as its parent ${parent.toString()} does not exist`
+      );
     }
     if (!this.components[parentId].dependencies) {
       this.components[parentId].dependencies = [dependency];
@@ -216,33 +541,65 @@ export default class BitMap {
     this.markAsChanged();
   }
 
+  /**
+   * find ids that have the same name but different version
+   * if compareWithoutScope is false, the scope should be identical in addition to the name
+   */
+  findSimilarIds(id: BitId, compareWithoutScope: boolean = false): BitIds {
+    const allIds = this.getAllBitIds([COMPONENT_ORIGINS.IMPORTED, COMPONENT_ORIGINS.AUTHORED]);
+    const similarIds = allIds.filter((existingId: BitId) => {
+      const isSimilar = compareWithoutScope
+        ? existingId.isEqualWithoutScopeAndVersion(id)
+        : existingId.isEqualWithoutVersion(id);
+      return isSimilar && !existingId.isEqual(id);
+    });
+    return BitIds.fromArray(similarIds);
+  }
+
   deleteOlderVersionsOfComponent(componentId: BitId): void {
-    const allVersions = Object.keys(this.components).filter(
-      id => BitId.parse(id).toStringWithoutVersion() === componentId.toStringWithoutVersion()
-    );
-    allVersions.forEach((version) => {
-      if (version !== componentId.toString() && this.components[version].origin !== COMPONENT_ORIGINS.NESTED) {
-        logger.debug(`BitMap: deleting an older version ${version} of an existing component ${componentId.toString()}`);
-        this._removeFromComponentsArray(version);
-      }
+    const similarIds = this.findSimilarIds(componentId);
+    similarIds.forEach((id) => {
+      const idStr = id.toString();
+      logger.debugAndAddBreadCrumb(
+        'BitMap.deleteOlderVersionsOfComponent',
+        'deleting an older version {idStr} of an existing component {componentId}',
+        { idStr, componentId: componentId.toString() }
+      );
+      this._removeFromComponentsArray(id);
     });
   }
 
   /**
-   * When the given id doesn't include scope-name, there might be a similar component in bit.map with scope-name
+   * --- Don't use this function when you have the ID parsed. Use this.getBitId() instead ---
+   *
+   * id entered by the user may or may not include scope-name
+   * search for a similar id in the bitmap and return the full BitId
    */
-  getExistingComponentId(componentIdStr: BitIdStr, origin?: ComponentOrigin | ComponentOrigin[]): ?BitIdStr {
-    const components = this.getAllComponents(origin);
-    if (components[componentIdStr]) return componentIdStr;
-    const parsedId = BitId.parse(componentIdStr);
-    if (parsedId.scope && !parsedId.hasVersion()) {
-      return Object.keys(components).find((component) => {
-        return BitId.parse(component).toStringWithoutVersion() === componentIdStr;
-      });
+  getExistingBitId(id: BitIdStr, shouldThrow: boolean = true): ?BitId {
+    if (!R.is(String, id)) {
+      throw new TypeError(`BitMap.getExistingBitId expects id to be a string, instead, got ${typeof id}`);
     }
-    return Object.keys(components).find((component) => {
-      return BitId.parse(component).toStringWithoutScopeAndVersion() === componentIdStr;
+    const components: ComponentMap[] = R.values(this.components);
+    const idHasVersion = id.includes(VERSION_DELIMITER);
+
+    // start with a more strict comparison. assume the id from the user has a scope name
+    const componentWithScope = components.find((componentMap: ComponentMap) => {
+      return idHasVersion ? componentMap.id.toString() === id : componentMap.id.toStringWithoutVersion() === id;
     });
+    if (componentWithScope) return componentWithScope.id;
+
+    // continue with searching without the scope name
+    const idWithoutVersion = BitId.getStringWithoutVersion(id);
+    const componentWithoutScope = components.find((componentMap: ComponentMap) => {
+      return idHasVersion
+        ? componentMap.id.toStringWithoutScope() === id
+        : componentMap.id.toStringWithoutScopeAndVersion() === idWithoutVersion;
+    });
+    if (componentWithoutScope) return componentWithoutScope.id;
+    if (shouldThrow) {
+      throw new MissingBitMapComponent(id);
+    }
+    return null;
   }
 
   /**
@@ -292,19 +649,23 @@ export default class BitMap {
     origin,
     parent,
     rootDir,
+    configDir,
     trackDir,
     override,
-    originallySharedDir
+    originallySharedDir,
+    wrapDir
   }: {
     componentId: BitId,
     files: ComponentMapFile[],
     mainFile?: PathOsBased,
     origin: ComponentOrigin,
-    parent?: BitId,
-    rootDir?: string,
+    parent?: ?BitId,
+    rootDir?: PathOsBasedAbsolute | PathOsBasedRelative,
+    configDir?: ?ConfigDir,
     trackDir?: PathOsBased,
-    override: boolean,
-    originallySharedDir?: PathLinux
+    override?: boolean,
+    originallySharedDir?: ?PathLinux,
+    wrapDir?: ?PathLinux
   }): ComponentMap {
     const isDependency = origin === COMPONENT_ORIGINS.NESTED;
     const componentIdStr = componentId.toString();
@@ -331,10 +692,7 @@ export default class BitMap {
         );
       }
       if (mainFile) {
-        this.components[componentIdStr].mainFile = this._getMainFile(
-          pathNormalizeToLinux(mainFile),
-          this.components[componentIdStr]
-        );
+        this.components[componentIdStr].mainFile = this._getMainFile(pathNormalizeToLinux(mainFile), componentIdStr);
       }
     } else {
       if (origin === COMPONENT_ORIGINS.IMPORTED || origin === COMPONENT_ORIGINS.AUTHORED) {
@@ -342,22 +700,22 @@ export default class BitMap {
         this.deleteOlderVersionsOfComponent(componentId);
       }
       // $FlowFixMe not easy to fix, we can't instantiate ComponentMap with mainFile because we don't have it yet
-      this.setComponent(componentIdStr, new ComponentMap({ files, origin }));
-      this.components[componentIdStr].mainFile = this._getMainFile(
-        pathNormalizeToLinux(mainFile),
-        this.components[componentIdStr]
-      );
+      const componentMap = new ComponentMap({ files, origin });
+      componentMap.setMarkAsChangedCb(this.markAsChangedBinded);
+      this.setComponent(componentId, componentMap);
+      this.components[componentIdStr].mainFile = this._getMainFile(pathNormalizeToLinux(mainFile), componentIdStr);
     }
     if (rootDir) {
-      // when rootDir is from the cli, it is changed to be absolute first (see write-components.writeToComponentsDir)
-      // and on the next line it is changed to be relative to the project-root.
-      // otherwise, rootDir may be originated from previous componentMap.rootDir value, as such,
-      // when running the command from an inner directory we must not run _makePathRelativeToProjectRoot.
-      const rootRelative = path.isAbsolute(rootDir) ? this._makePathRelativeToProjectRoot(rootDir) : rootDir;
-      this.components[componentIdStr].rootDir = pathNormalizeToLinux(rootRelative);
+      this.components[componentIdStr].rootDir = pathNormalizeToLinux(rootDir);
+    }
+    if (configDir) {
+      this.components[componentIdStr].configDir = configDir;
     }
     if (trackDir) {
       this.components[componentIdStr].trackDir = pathNormalizeToLinux(trackDir);
+    }
+    if (wrapDir) {
+      this.components[componentIdStr].wrapDir = wrapDir;
     }
     this.components[componentIdStr].removeTrackDirIfNeeded();
     if (originallySharedDir) {
@@ -395,16 +753,17 @@ export default class BitMap {
   _invalidateCache = () => {
     this.paths = {};
     this.pathsLowerCase = {};
+    this.allIds = undefined;
+    this.allTrackDirs = undefined;
   };
 
-  _removeFromComponentsArray(componentId: BitIdStr) {
-    delete this.components[componentId];
+  _removeFromComponentsArray(componentId: BitId) {
+    delete this.components[componentId.toString()];
     this.markAsChanged();
   }
 
-  removeComponent(id: string | BitId) {
-    const bitId = id instanceof BitId ? id : BitId.parse(id);
-    const bitmapComponent = this.getExistingComponentId(bitId.toStringWithoutScopeAndVersion());
+  removeComponent(bitId: BitId) {
+    const bitmapComponent = this.getBitIdIfExist(bitId, { ignoreScopeAndVersion: true });
     if (bitmapComponent) this._removeFromComponentsArray(bitmapComponent);
     return bitmapComponent;
   }
@@ -436,71 +795,37 @@ export default class BitMap {
   /**
    * needed after exporting or tagging a component.
    * We don't support export/tag of nested components, only authored or imported. For authored/imported components, could be
-   * in the file-system only one instance with the same box-name and component-name. As a result, we can strip the
+   * in the file-system only one instance with the same component-name. As a result, we can strip the
    * scope-name and the version, find the older version in bit.map and update the id with the new one.
    */
   updateComponentId(id: BitId): void {
     const newIdString = id.toString();
-    const olderComponentsIds = Object.keys(this.components).filter(
-      componentId =>
-        BitId.parse(componentId).toStringWithoutScopeAndVersion() === id.toStringWithoutScopeAndVersion() &&
-        componentId !== newIdString &&
-        this.components[componentId].origin !== COMPONENT_ORIGINS.NESTED
-    );
-
-    if (!olderComponentsIds.length) {
+    const similarIds = this.findSimilarIds(id, true);
+    if (!similarIds.length) {
       logger.debug(`bit-map: no need to update ${newIdString}`);
       return;
     }
-    if (olderComponentsIds.length > 1) {
+    if (similarIds.length > 1) {
       throw new GeneralError(`Your ${BIT_MAP} file has more than one version of ${id.toStringWithoutScopeAndVersion()} and they
       are authored or imported. This scenario is not supported`);
     }
-    const olderComponentId = olderComponentsIds[0];
-    logger.debug(`BitMap: updating an older component ${olderComponentId} with a newer component ${newIdString}`);
-    const componentMap = this.components[olderComponentId];
+    const olderComponentId: BitId = similarIds[0];
+    const olderComponentIdStr: string = olderComponentId.toString();
+    const olderIdStr = olderComponentId.toString();
+    logger.debug(`BitMap: updating an older component ${olderIdStr} with a newer component ${newIdString}`);
+    const componentMap = this.components[olderIdStr];
     this._removeFromComponentsArray(olderComponentId);
-    this.setComponent(newIdString, componentMap);
+    this.setComponent(id, componentMap);
 
     // update the dependencies array if needed
     Object.keys(this.components).forEach((componentId) => {
       const component = this.components[componentId];
-      if (component.dependencies && component.dependencies.includes(olderComponentId)) {
-        component.dependencies = component.dependencies.filter(dependency => dependency !== olderComponentId);
+      if (component.dependencies && component.dependencies.includes(olderComponentIdStr)) {
+        component.dependencies = component.dependencies.filter(dependency => dependency !== olderComponentIdStr);
         component.dependencies.push(newIdString);
       }
     });
     this.markAsChanged();
-  }
-
-  /**
-   * Get component from bitmap by id if exists
-   *
-   * @param {string | BitId} id - component id
-   * @param {Boolean} shouldThrow - should throw error in case of missing
-   * @param {Boolean} includeSearchByBoxAndNameOnly - should compare with box and name of component (without scope or verison)
-   * @returns {ComponentMap} componentMap
-   */
-  getComponent(
-    id: string | BitId,
-    shouldThrow: boolean = false,
-    includeSearchByBoxAndNameOnly: boolean = false,
-    ignoreVersion: boolean = false
-  ): ComponentMap {
-    const bitId: BitId = R.is(String, id) ? BitId.parse(id) : id;
-    if (!ignoreVersion && bitId.hasVersion()) {
-      if (!this.components[bitId] && shouldThrow) throw new MissingBitMapComponent(bitId.toString());
-      return this.components[bitId];
-    }
-    const idWithVersion = Object.keys(this.components).find(
-      componentId =>
-        BitId.parse(componentId).toStringWithoutVersion() === bitId.toStringWithoutVersion() ||
-        (includeSearchByBoxAndNameOnly &&
-          BitId.parse(componentId).toStringWithoutScopeAndVersion() === bitId.toStringWithoutScopeAndVersion())
-    );
-    if (!idWithVersion && shouldThrow) throw new MissingBitMapComponent(bitId.toString());
-    // $FlowFixMe
-    return this.components[idWithVersion];
   }
 
   /**
@@ -520,10 +845,10 @@ export default class BitMap {
    * by a path exist in the files object
    *
    * @param {string} componentPath relative to consumer - as stored in bit.map files object
-   * @returns {string} component id
+   * @returns {BitId} component id
    * @memberof BitMap
    */
-  getComponentIdByPath(componentPath: string, caseSensitive: boolean = true): string {
+  getComponentIdByPath(componentPath: string, caseSensitive: boolean = true): BitId {
     this._populateAllPaths();
     return caseSensitive ? this.paths[componentPath] : this.pathsLowerCase[componentPath.toLowerCase()];
   }
@@ -536,11 +861,24 @@ export default class BitMap {
           const relativeToConsumer = component.rootDir
             ? pathJoinLinux(component.rootDir, file.relativePath)
             : file.relativePath;
-          this.paths[relativeToConsumer] = componentId;
-          this.pathsLowerCase[relativeToConsumer.toLowerCase()] = componentId;
+          this.paths[relativeToConsumer] = component.id;
+          this.pathsLowerCase[relativeToConsumer.toLowerCase()] = component.id;
         });
       });
     }
+  }
+
+  getAllTrackDirs() {
+    if (!this.allTrackDirs) {
+      this.allTrackDirs = {};
+      Object.keys(this.components).forEach((componentId) => {
+        const component = this.components[componentId];
+        if (!component.trackDir) return;
+        // $FlowFixMe
+        this.allTrackDirs[component.trackDir] = component.id;
+      });
+    }
+    return this.allTrackDirs;
   }
 
   updatePathLocation(
@@ -553,7 +891,7 @@ export default class BitMap {
     Object.keys(this.components).forEach((componentId) => {
       const componentMap: ComponentMap = this.components[componentId];
       const changes = isPathDir ? componentMap.updateDirLocation(from, to) : componentMap.updateFileLocation(from, to);
-      if (changes && changes.length) allChanges.push({ id: componentId, changes });
+      if (changes && changes.length) allChanges.push({ id: componentMap.id.clone(), changes });
     });
     if (R.isEmpty(allChanges)) {
       const errorMsg = isPathDir
@@ -567,6 +905,23 @@ export default class BitMap {
   }
 
   /**
+   * remove the id property before saving the components to the file as they are redundant with the keys
+   */
+  toObjects(): Object {
+    const components = {};
+    Object.keys(this.components).forEach((id) => {
+      const componentMap = this.components[id].clone();
+      if (componentMap.origin === COMPONENT_ORIGINS.AUTHORED) {
+        componentMap.exported = componentMap.id.hasScope();
+      }
+      delete componentMap.id;
+      components[id] = componentMap.toPlainObject();
+    });
+
+    return components;
+  }
+
+  /**
    * do not call this function directly, let consumer.onDestroy() call it.
    * consumer.onDestroy() is being called (manually) at the end of the command process.
    * the risk of calling this method in other places is a parallel writing of this file, which
@@ -575,7 +930,12 @@ export default class BitMap {
   async write(): Promise<any> {
     if (!this.hasChanged) return null;
     logger.debug('writing to bit.map');
-    const bitMapContent = Object.assign({}, this.components, { version: this.version });
+    const bitMapContent = this.getContent();
     return outputFile({ filePath: this.mapPath, content: JSON.stringify(bitMapContent, null, 4) });
+  }
+
+  getContent(): Object {
+    const bitMapContent = Object.assign({}, this.toObjects(), { version: this.version });
+    return bitMapContent;
   }
 }

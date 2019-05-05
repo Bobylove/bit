@@ -1,8 +1,8 @@
 // @flow
 import R from 'ramda';
 import isGlob from 'is-glob';
-import fs from 'fs';
-import { pathNormalizeToLinux } from './index';
+import fs from 'fs-extra';
+import { pathNormalizeToLinux } from './path';
 import type { PathOsBased } from './path';
 
 const DSL = ['{PARENT}', '{FILE_NAME}'];

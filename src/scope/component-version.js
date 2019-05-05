@@ -1,21 +1,23 @@
 /** @flow */
-import Component from './models/component';
-import Version from './models/version';
-import { BitId } from '../bit-id';
-import Scope from './scope';
+import semver from 'semver';
+import R from 'ramda';
+import type ModelComponent from './models/model-component';
+import type Version from './models/version';
+import { BitId, BitIds } from '../bit-id';
 import Repository from './objects/repository';
-import VersionDependencies from './version-dependencies';
 import ComponentObjects from './component-objects';
 import logger from '../logger/logger';
-import ConsumerComponent from '../consumer/component';
+import type ConsumerComponent from '../consumer/component';
 import GeneralError from '../error/general-error';
 import { HashMismatch } from './exceptions';
+import type { ManipulateDirItem } from '../consumer/component-ops/manipulate-dir';
+import CustomError from '../error/custom-error';
 
 export default class ComponentVersion {
-  component: Component;
+  component: ModelComponent;
   version: string;
 
-  constructor(component: Component, version: string) {
+  constructor(component: ModelComponent, version: string) {
     this.component = component;
     this.version = version;
   }
@@ -24,18 +26,25 @@ export default class ComponentVersion {
     return this.component.loadVersion(this.version, repository);
   }
 
-  flattenedDependencies(repository: Repository): Promise<BitId[]> {
+  flattenedDependencies(repository: Repository): Promise<BitIds> {
     return this.getVersion(repository).then(version => version.flattenedDependencies);
   }
 
-  flattenedDevDependencies(repository: Repository): Promise<BitId[]> {
+  flattenedDevDependencies(repository: Repository): Promise<BitIds> {
     return this.getVersion(repository).then(version => version.flattenedDevDependencies);
   }
 
-  toId() {
+  flattenedCompilerDependencies(repository: Repository): Promise<BitIds> {
+    return this.getVersion(repository).then(version => version.flattenedCompilerDependencies);
+  }
+
+  flattenedTesterDependencies(repository: Repository): Promise<BitIds> {
+    return this.getVersion(repository).then(version => version.flattenedTesterDependencies);
+  }
+
+  toId(): BitId {
     return new BitId({
       scope: this.component.scope,
-      box: this.component.box,
       name: this.component.name,
       version: this.version
     });
@@ -45,45 +54,20 @@ export default class ComponentVersion {
     return this.toId();
   }
 
-  async toVersionDependencies(scope: Scope, source: string, withEnvironments?: boolean): Promise<VersionDependencies> {
-    const version = await this.getVersion(scope.objects);
-    if (!version) {
-      logger.debug(
-        `toVersionDependencies, component ${this.component.id().toString()}, version ${
-          this.version
-        } not found, going to fetch from a remote`
-      );
-      if (this.component.scope === scope.name) {
-        // it should have been fetched locally, since it wasn't found, this is an error
-        throw new GeneralError(
-          `Version ${this.version} of ${this.component.id().toString()} was not found in scope ${scope.name}`
-        );
-      }
-      return scope.remotes().then((remotes) => {
-        const src = this.id;
-        src.scope = source;
-        return scope.getExternal({ id: src, remotes, localFetch: false, withEnvironments });
-      });
-    }
-
-    logger.debug(
-      `toVersionDependencies, component ${this.component.id().toString()}, version ${
-        this.version
-      } found, going to collect its dependencies`
-    );
-    const dependencies = await version.collectDependencies(scope, withEnvironments);
-    const devDependencies = await version.collectDependencies(scope, withEnvironments, true);
-
-    return new VersionDependencies(this, dependencies, devDependencies, source);
+  toConsumer(repo: Repository, manipulateDirData: ?(ManipulateDirItem[])): Promise<ConsumerComponent> {
+    // $FlowFixMe
+    return this.component.toConsumerComponent(this.version, this.component.scope, repo, manipulateDirData);
   }
 
-  toConsumer(repo: Repository): Promise<ConsumerComponent> {
-    return this.component.toConsumerComponent(this.version, this.component.scope, repo);
-  }
-
-  async toObjects(repo: Repository): Promise<ComponentObjects> {
+  async toObjects(repo: Repository, clientVersion: ?string): Promise<ComponentObjects> {
     const version = await this.getVersion(repo);
     if (!version) throw new GeneralError(`failed loading version ${this.version} of ${this.component.id()}`);
+    // @todo: remove this customError once upgrading to v15, because when the server has v15
+    // and the client has < 15, the client will get anyway an error to upgrade the version
+    if (clientVersion && version.overrides && !R.isEmpty(version.overrides) && semver.lt(clientVersion, '14.1.0')) {
+      throw new CustomError(`Your components were created with a newer version and use the "overrides" feature.
+Please upgrade your bit client to version >= v14.1.0`);
+    }
     try {
       const [compObject, objects, versionBuffer, scopeMeta] = await Promise.all([
         this.component.asRaw(repo),

@@ -6,7 +6,7 @@ export default ({ dependentBits, modifiedComponents = [], removedComponentIds, m
   const paintMissingComponents = () => {
     if (R.isEmpty(missingComponents)) return '';
     return (
-      chalk.red('missing components:') +
+      chalk.red('missing components (try to `bit untrack` them instead):') +
       chalk(
         ` ${missingComponents.map((id) => {
           if (!(id instanceof BitId)) id = new BitId(id); // when the id was received from a remote it's not an instance of BitId
@@ -43,10 +43,12 @@ export default ({ dependentBits, modifiedComponents = [], removedComponentIds, m
 
   const paintModifiedComponents = () =>
     (!R.isEmpty(modifiedComponents)
-      ? `${chalk.red.underline('error: unable to remove modified components:') +
+      ? `${chalk.red(
+        'error: unable to remove modified components (please use --force to remove modified components)\n'
+      ) +
           chalk(
-            ` ${modifiedComponents.map(id => (id.version === 'latest' ? id.toStringWithoutVersion() : id.toString()))}`
-          )},${chalk.red(' please use --force flag')}`
+            `- ${modifiedComponents.map(id => (id.version === 'latest' ? id.toStringWithoutVersion() : id.toString()))}`
+          )}`
       : '');
 
   return (

@@ -20,16 +20,21 @@ const TROUBLESHOOTING_MESSAGE = `${chalk.yellow(
 )}`;
 
 export const statusFailureMsg = 'issues found';
+export const statusInvalidComponentsMsg = 'invalid components';
+export const statusWorkspaceIsCleanMsg =
+  'nothing to tag or export (use "bit add <file...>" to track files or directories as components)';
 
 export default class Status extends Command {
   name = 'status';
   description = `show the working area component(s) status.\n  https://${BASE_DOCS_DOMAIN}/docs/cli-status.html`;
   alias = 's';
-  opts = [];
+  opts = [['j', 'json', 'return a json version of the component']];
   loader = true;
   migration = true;
+  json = false;
 
-  action(): Promise<Object> {
+  action([], { json }: { json?: boolean }): Promise<Object> {
+    this.json = json;
     return status();
   }
 
@@ -43,6 +48,22 @@ export default class Status extends Command {
     invalidComponents,
     outdatedComponents
   }: StatusResult): string {
+    if (this.json) {
+      return JSON.stringify(
+        {
+          newComponents,
+          modifiedComponent: modifiedComponent.map(c => c.id.toString()),
+          stagedComponents: stagedComponents.map(c => c.id()),
+          componentsWithMissingDeps: componentsWithMissingDeps.map(c => c.id.toString()),
+          importPendingComponents: importPendingComponents.map(c => c.id.toString()),
+          autoTagPendingComponents,
+          invalidComponents,
+          outdatedComponents: outdatedComponents.map(c => c.id.toString())
+        },
+        null,
+        2
+      );
+    }
     // If there is problem with at least one component we want to show a link to the
     // troubleshooting doc
     let showTroubleshootingLink = false;
@@ -137,7 +158,7 @@ export default class Status extends Command {
     const invalidDesc = '\nthese components were failed to load.\n';
     const invalidComponentOutput = immutableUnshift(
       invalidComponents.map(c => format(c.id.toString(), true, getInvalidComponentLabel(c.error))).sort(),
-      invalidComponents.length ? chalk.underline.white('invalid components') + invalidDesc : ''
+      invalidComponents.length ? chalk.underline.white(statusInvalidComponentsMsg) + invalidDesc : ''
     ).join('\n');
 
     const stagedDesc = '\n(use "bit export <remote_scope> to push these components to a remote scope")\n';
@@ -160,8 +181,7 @@ export default class Status extends Command {
         ]
           .filter(x => x)
           .join(chalk.underline('\n                         \n') + chalk.white('\n')) +
-        troubleshootingStr ||
-      chalk.yellow('nothing to tag or export (use "bit add <file...>" to track files or directories as components)')
+        troubleshootingStr || chalk.yellow(statusWorkspaceIsCleanMsg)
     );
   }
 }

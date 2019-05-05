@@ -1,9 +1,11 @@
 /** @flow */
 
-import { getScopeComponent } from './api/consumer/index';
+import { getScopeComponent, addMany } from './api/consumer/index';
+import type { AddProps } from './consumer/component-ops/add-components/add-components';
 import { scopeList } from './api/scope/index';
 import Extension from './extensions/extension';
 import HooksManager from './hooks';
+import type { BaseLoadArgsProps } from './extensions/base-extension';
 
 HooksManager.init();
 
@@ -15,22 +17,16 @@ module.exports = {
       }
       return c.toObject();
     }),
-  list: (scopePath: string) => scopeList(scopePath).then(components => components.map(c => c.id.toString())),
+  list: (scopePath: string) =>
+    scopeList(scopePath).then(listScopeResult => listScopeResult.map(result => result.id.toString())),
+  addMany: async (components: AddProps[], alternateCwd?: string) => {
+    return addMany(components, alternateCwd);
+  },
   /**
    * Load extension programmatically
    */
-  loadExtension: async (
-    extensionName: string,
-    extensionFilePath: string,
-    extensionConfig: Object,
-    extensionOptions: Object
-  ): Promise<Extension> => {
-    const extension = await Extension.loadFromFile({
-      name: extensionName,
-      filePath: extensionFilePath,
-      rawConfig: extensionConfig,
-      options: extensionOptions
-    });
+  loadExtension: async (args: BaseLoadArgsProps): Promise<Extension> => {
+    const extension = await Extension.load(args);
     return Promise.resolve(extension);
   }
 };

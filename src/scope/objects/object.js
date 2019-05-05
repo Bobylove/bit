@@ -1,10 +1,9 @@
 /** @flow */
 import { inflateSync } from 'zlib';
-import Repository from './repository';
+import type Repository from './repository';
 import { deflate, inflate, sha1 } from '../../utils';
 import { NULL_BYTE, SPACE_DELIMITER } from '../../constants';
 import Ref from './ref';
-import GeneralError from '../../error/general-error';
 // import logger from '../../logger/logger';
 
 function parse(buffer: Buffer, types: { [string]: Function }): BitObject {
@@ -36,49 +35,28 @@ export default class BitObject {
     return [];
   }
 
-  get header(): string {
-    return `${this.constructor.name} ${this.hash().toString()} ${this.toBuffer().toString().length}${NULL_BYTE}`;
+  getHeader(buffer: Buffer): string {
+    return `${this.constructor.name} ${this.hash().toString()} ${buffer.toString().length}${NULL_BYTE}`;
   }
 
-  collectRefs(repo: Repository, throws: boolean = true): Ref[] {
+  async collectRefs(repo: Repository): Promise<Ref[]> {
     const refsCollection = [];
 
-    function addRefs(object: BitObject) {
+    async function addRefs(object: BitObject) {
       const refs = object.refs();
-      const objs = refs
-        .map((ref) => {
-          return ref.loadSync(repo, throws);
-        })
-        .filter(x => x);
-
+      const objs = await Promise.all(refs.map(ref => ref.load(repo, true)));
       refsCollection.push(...refs);
-      objs.forEach(obj => addRefs(obj));
+      // $FlowFixMe
+      await Promise.all(objs.map(obj => addRefs(obj)));
     }
 
-    addRefs(this);
+    await addRefs(this);
     return refsCollection;
   }
 
-  collectExistingRefs(repo: Repository, throws: boolean = true): Ref[] {
-    const refsCollection = [];
-
-    function addRefs(object: BitObject) {
-      const refs = object.refs();
-      const objs = refs
-        .map((ref) => {
-          return ref.loadSync(repo, throws);
-        })
-        .filter(x => x);
-      const filtered = refs.filter(ref => repo.loadSync(ref, false));
-      refsCollection.push(...filtered);
-      objs.forEach(obj => addRefs(obj));
-    }
-
-    addRefs(this);
-    return refsCollection;
-  }
-  collectRaw(repo: Repository): Promise<Buffer[]> {
-    return Promise.all(this.collectRefs(repo).map(ref => ref.loadRaw(repo)));
+  async collectRaw(repo: Repository): Promise<Buffer[]> {
+    const refs = await this.collectRefs(repo);
+    return Promise.all(refs.map(ref => ref.loadRaw(repo)));
   }
 
   asRaw(repo: Repository): Promise<Buffer> {
@@ -86,14 +64,15 @@ export default class BitObject {
   }
 
   collect(repo: Repository): BitObject[] {
-    const objects = [];
+    const objects: BitObject[] = [];
 
     function addRefs(object: BitObject) {
       const objs = object.refs().map((ref) => {
         return ref.loadSync(repo);
       });
 
-      objects.push(...objs);
+      objects.concat(objs);
+      // $FlowFixMe
       objs.forEach(obj => addRefs(obj));
     }
 
@@ -106,7 +85,7 @@ export default class BitObject {
    */
   hash(): Ref {
     // console.log(`sha ${sha1(this.id())}, id ${this.id()}`); // uncomment when debugging hash issues
-    return new Ref(sha1(this.id()));
+    return new Ref(BitObject.makeHash(this.id()));
   }
 
   compress(): Promise<Buffer> {
@@ -114,15 +93,26 @@ export default class BitObject {
   }
 
   serialize(): Buffer {
-    return Buffer.concat([Buffer.from(this.header), this.toBuffer()]);
+    const buffer = this.toBuffer();
+    return Buffer.concat([Buffer.from(this.getHeader(buffer)), buffer]);
   }
 
+  /**
+   * see `this.parseSync` for the sync version
+   */
   static parseObject(fileContents: Buffer, types: { [string]: Function }): Promise<BitObject> {
     return inflate(fileContents).then(buffer => parse(buffer, types));
   }
 
+  /**
+   * prefer using `this.parseObject()`, unless it must be sync.
+   */
   static parseSync(fileContents: Buffer, types: { [string]: Function }): BitObject {
     const buffer = inflateSync(fileContents);
     return parse(buffer, types);
+  }
+
+  static makeHash(str: string | Buffer): string {
+    return sha1(str);
   }
 }

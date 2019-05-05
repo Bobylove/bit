@@ -1,9 +1,13 @@
 // @flow
 import { loadConsumer, Consumer } from '../../../consumer';
 import { BitId } from '../../../bit-id';
-import { removeLocalVersion, removeLocalVersionsForAllComponents } from '../../../scope/component-ops/untag-component';
+import {
+  removeLocalVersion,
+  removeLocalVersionsForAllComponents,
+  removeLocalVersionsForComponentsMatchedByWildcard
+} from '../../../scope/component-ops/untag-component';
 import type { untagResult } from '../../../scope/component-ops/untag-component';
-import GeneralError from '../../../error/general-error';
+import hasWildcard from '../../../utils/string/has-wildcard';
 
 /**
  * in case the untagged version is the current version in bitmap, update to the latest version
@@ -12,17 +16,10 @@ import GeneralError from '../../../error/general-error';
 function updateBitMap(consumer: Consumer, untagResults: untagResult[]): void {
   untagResults.forEach((result: untagResult) => {
     const { id, versions, component } = result;
-    const idStr = id.toString();
-    const currentId = consumer.bitMap.getExistingComponentId(idStr);
-    if (!currentId) throw new GeneralError(`id ${idStr} is missing from bitmap`);
-    const currentBitId = BitId.parse(currentId);
-    if (currentBitId.hasVersion() && versions.includes(currentBitId.version)) {
-      const newId = currentBitId.clone();
-      if (!component.versionArray.length) {
-        newId.version = null;
-      } else {
-        newId.version = component.latest();
-      }
+    const currentId: BitId = consumer.bitMap.getBitId(id, { ignoreVersion: true });
+    if (currentId.hasVersion() && versions.includes(currentId.version)) {
+      const newVersion = component.versionArray.length ? component.latest() : null;
+      const newId = currentId.changeVersion(newVersion);
       consumer.bitMap.updateComponentId(newId);
     }
   });
@@ -31,8 +28,12 @@ function updateBitMap(consumer: Consumer, untagResults: untagResult[]): void {
 export default (async function unTagAction(version?: string, force: boolean, id?: string): Promise<untagResult[]> {
   const consumer: Consumer = await loadConsumer();
   const untag = async (): Promise<untagResult[]> => {
+    const idHasWildcard = hasWildcard(id);
+    if (idHasWildcard) {
+      return removeLocalVersionsForComponentsMatchedByWildcard(consumer.scope, version, force, id);
+    }
     if (id) {
-      const bitId = BitId.parse(id);
+      const bitId = consumer.getParsedId(id);
       // a user might run the command `bit untag id@version` instead of `bit untag id version`
       if (bitId.hasVersion() && !version) version = bitId.version;
       const result = await removeLocalVersion(consumer.scope, bitId, version, force);
@@ -42,6 +43,7 @@ export default (async function unTagAction(version?: string, force: boolean, id?
     return removeLocalVersionsForAllComponents(consumer.scope, version, force);
   };
   const results = await untag();
+  await consumer.scope.objects.persist();
   updateBitMap(consumer, results);
   await consumer.onDestroy();
   return results;

@@ -10,13 +10,19 @@ import GeneralError from '../../../error/general-error';
 
 export default class Remove extends Command {
   name = 'remove <ids...>';
-  description = `remove a component (local/remote)\n  https://${BASE_DOCS_DOMAIN}/docs/removing-components.html`;
+  description = `remove a component (local/remote)
+  https://${BASE_DOCS_DOMAIN}/docs/removing-components.html
+  the id can be used with wildcards (e.g. bit remove "utils/*")`;
   alias = 'rm';
   opts = [
     ['f', 'force [boolean]', 'force remove (default = false)'],
     ['r', 'remote', 'remove a component from a remote scope'],
     ['t', 'track [boolean]', 'keep tracking component (default = false)'],
-    ['d', 'delete-files [boolean]', 'delete local component files'],
+    [
+      'd',
+      'delete-files [boolean]',
+      'delete local component files (authored components only. for imported components the files are always deleted)'
+    ],
     ['s', 'silent [boolean]', 'skip confirmation']
   ];
   loader = true;

@@ -1,70 +1,61 @@
 import { expect } from 'chai';
-import sinon from 'sinon';
-import ConsumerComponent from '../../../src/consumer/component/consumer-component';
-import BitId from '../../../src/bit-id/bit-id';
-import Impl from '../../../src/consumer/component/sources/impl';
-import { VERSION_DELIMITER } from '../../../src/constants';
+import withCompilerFixture from '../../../fixtures/consumer-components/with-compiler/with-compiler.json';
+import Component from './consumer-component';
+import CompilerExtension from '../../extensions/compiler-extension';
+import { SourceFile } from './sources';
 
-describe.skip('ConsumerComponent', () => {
-  describe('build', () => {
-    let consumerComponent;
-    before(() => {
-      const bitId = new BitId({ scope: 'scope', box: 'box', name: 'name', version: 2 });
-      consumerComponent = new ConsumerComponent({
-        name: 'component-name',
-        box: 'box',
-        version: 1,
-        scope: 'myScope',
-        implFile: '',
-        specsFile: '',
-        compilerId: bitId,
-        testerId: bitId,
-        dependencies: {},
-        packageDependencies: {},
-        impl: 'impl',
-        specs: 'specs'
+describe('ConsumerComponent', function () {
+  this.timeout(0);
+  describe('fromString()', () => {
+    describe('component with compiler', () => {
+      let component;
+      before(async () => {
+        component = await Component.fromString(JSON.stringify(withCompilerFixture));
       });
-      sinon.stub(Impl, ['load']).returns('impl');
-    });
-
-    it('should use the ".js" extension for the impl dist file when the lang attribute was not set', () => {
-      expect(consumerComponent.distImplFileName).to.equal('impl.js');
-    });
-
-    it('should use the ".js" extension for the spec dist file when the lang attribute was not set', () => {
-      expect(consumerComponent.distSpecFileName).to.equal('spec.js');
-    });
-
-    it('should throw an error for a mismatch compiler interface', () => {
-      const scope = {
-        loadEnvironment: () => {
-          return {};
-        }
-      };
-      const result = consumerComponent.build({ scope });
-      expect(result).to.be.a('Promise');
-      return result
-        .then(() => {
-          throw new Error('Promise should fail');
-        })
-        .catch((err) => {
-          expect(err).to.eql(
-            `"scope/box/name${VERSION_DELIMITER}2" does not have a valid compiler interface, it has to expose a build method`
-          );
-        });
-    });
-
-    xit('should NOT throw an error for a correct compiler interface', () => {
-      const scope = {
-        loadEnvironment: () => {
-          return { compile: () => '' };
-        }
-      };
-      const result = consumerComponent.build({ scope });
-      expect(result).to.be.a('Promise');
-      return result.then().catch(() => {
-        throw new Error('Promise should succeed');
+      it('should not crash and return a ConsumerComponent Object', async () => {
+        expect(component).to.be.instanceOf(Component);
       });
+      it('should convert the compiler object to a Compiler instance', () => {
+        expect(component.compiler).to.be.instanceOf(CompilerExtension);
+      });
+    });
+  });
+  describe('docs', () => {
+    const componentProps = {
+      name: 'is-string',
+      mainFile: 'is-string.js',
+      files: [new SourceFile({ base: '.', path: 'is-string.js', contents: Buffer.from(''), test: false })]
+    };
+    it('should return an empty array when there is no docs', () => {
+      const component = new Component(componentProps);
+      expect(component.docs).to.deep.equal([]);
+    });
+    it('should return the docs when a file has a jsdoc block', async () => {
+      const src = `/**
+      * is a given variable a string
+      */
+      function isString() {}`;
+      const sourceFile = new SourceFile({ base: '.', path: 'is-string.js', contents: Buffer.from(src), test: false });
+      componentProps.files = [sourceFile];
+      const component = new Component(componentProps);
+      expect(component.docs).to.have.lengthOf(1);
+      expect(component.docs[0].description).to.equal('is a given variable a string');
+    });
+    it('should return the docs only for non-test files with jsdocs', async () => {
+      const src = `/**
+      * is a given variable a string
+      */
+      function isString() {}`;
+      const sourceFile = new SourceFile({ base: '.', path: 'is-string.js', contents: Buffer.from(src), test: false });
+      const sourceFileSpec = new SourceFile({
+        base: '.',
+        path: 'is-string.spec.js',
+        contents: Buffer.from(src),
+        test: true
+      });
+      componentProps.files = [sourceFile, sourceFileSpec];
+      const component = new Component(componentProps);
+      expect(component.docs).to.have.lengthOf(1);
     });
   });
 });

@@ -1,76 +1,66 @@
 // @flow
-import R from 'ramda';
-import format from 'string-format';
 import {
-  DEFAULT_COMPONENTES_DIR_PATH,
+  DEFAULT_COMPONENTS_DIR_PATH,
   DEFAULT_DEPENDENCIES_DIR_PATH,
   DEFAULT_EJECTED_ENVS_DIR_PATH
 } from '../../constants';
 import GeneralError from '../../error/general-error';
+import ConfigDir from '../bit-map/config-dir';
+import logger from '../../logger/logger';
 
 export default class BitStructure {
-  componentsDefaultDirectory: string;
+  _componentsDefaultDirectoryUnProcessed: string;
+  _componentsDefaultDirectory: string;
   dependenciesDirectory: string;
   ejectedEnvsDirectory: string;
-  constructor(componentsDefaultDirectory, dependenciesDirectory, ejectedEnvsDirectory) {
-    this.componentsDefaultDirectory = componentsDefaultDirectory || DEFAULT_COMPONENTES_DIR_PATH;
+  constructor(componentsDefaultDirectory: ?string, dependenciesDirectory: ?string, ejectedEnvsDirectory: ?string) {
+    this._componentsDefaultDirectoryUnProcessed = componentsDefaultDirectory || DEFAULT_COMPONENTS_DIR_PATH;
     this.dependenciesDirectory = dependenciesDirectory || DEFAULT_DEPENDENCIES_DIR_PATH;
     this.ejectedEnvsDirectory = ejectedEnvsDirectory || DEFAULT_EJECTED_ENVS_DIR_PATH;
-  }
-
-  _getComponentStructurePart(componentStructure: string, componentPart: string): string {
-    switch (componentPart) {
-      case 'name':
-        return 'name';
-      case 'namespace':
-        return 'box';
-      case 'scope':
-        return 'scope';
-      case 'version':
-        return 'version';
-      default:
-        throw new GeneralError(`the ${componentPart} part of the component structure
-           ${componentStructure} is invalid, it must be one of the following: "name", "namespace", "scope" or "version" `);
-    }
   }
 
   get dependenciesDirStructure(): string {
     return this.dependenciesDirectory;
   }
 
-  get ejectedEnvsDirStructure(): string {
-    return this.ejectedEnvsDirectory;
+  get ejectedEnvsDirStructure(): ConfigDir {
+    return new ConfigDir(this.ejectedEnvsDirectory);
   }
 
-  /**
-   * Return only the static parts of the ejectedEnvs dir
-   * Used for adding it to the ignore list
-   */
-  get staticEjectedEnvsDirStructure(): string {
-    const ejectedEnvsDirectory = this.ejectedEnvsDirectory;
-    const staticEjectedEnvsDirectory = format(ejectedEnvsDirectory, { envType: '' });
-    return staticEjectedEnvsDirectory;
-  }
-
-  get componentsDirStructure(): Object {
-    const dirStructure = this.componentsDefaultDirectory;
-    const staticParts = [];
-    const dynamicParts = [];
-    dirStructure.split('/').forEach((dir) => {
-      if (dir.startsWith('{') && dir.endsWith('}')) {
-        // this is a variable
-        const dirStripped = dir.replace(/[{}]/g, '');
-        const componentPart = this._getComponentStructurePart(dirStructure, dirStripped);
-        dynamicParts.push(componentPart);
-      } else {
-        // todo: create a new exception class
-        if (!R.isEmpty(dynamicParts)) {
-          throw new GeneralError(`${dirStructure} is invalid, a static directory can not be after the dynamic part`);
+  get componentsDefaultDirectory(): string {
+    if (!this._componentsDefaultDirectory) {
+      const dirStructure = this._componentsDefaultDirectoryUnProcessed;
+      const dirStructureParsed = [];
+      dirStructure.split('/').forEach((dir) => {
+        if (dir.startsWith('{') && dir.endsWith('}')) {
+          // this is a dynamic parameter
+          const dirStripped = dir.replace(/[{}]/g, '');
+          const componentPart = this._getComponentStructurePart(dirStructure, dirStripped);
+          if (componentPart) dirStructureParsed.push(`{${componentPart}}`);
+        } else {
+          dirStructureParsed.push(dir);
         }
-        staticParts.push(dir);
-      }
-    });
+      });
+      this._componentsDefaultDirectory = dirStructureParsed.join('/');
+    }
+    return this._componentsDefaultDirectory;
+  }
 
-    return { staticParts, dynamicParts };
+  _getComponentStructurePart(componentStructure: string, componentPart: string): string {
+    switch (componentPart) {
+      case 'name':
+      case 'scope':
+      case 'version':
+        return componentPart;
+      case 'namespace':
+        logger.warn(
+          'your bit.json has an obsolete "namespace" set in componentsDefaultDirectory property, it has been ignored'
+        );
+        return ''; // this the dynamic namespace feature, the namespace doesn't exist, it's part of the name
+      default:
+        throw new GeneralError(
+          `the "${componentPart}" part of the component structure "${componentStructure}" is invalid, it must be one of the following: "name", "scope" or "version" `
+        );
+    }
   }
 }

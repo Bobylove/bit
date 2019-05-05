@@ -1,10 +1,7 @@
 /** @flow */
-import fs from 'fs';
+import fs from 'fs-extra';
 
-export default function isDirEmpty(dirPath: string, cb: (itDoes: boolean) => void) {
-  fs.readdir(dirPath, (err, files) => {
-    if (err) throw err;
-    if (!files.length) return cb(true);
-    return cb(false);
-  });
-}
+export default (async function isDirEmpty(dirPath: string): Promise<boolean> {
+  const files = await fs.readdir(dirPath);
+  return !files.length;
+});

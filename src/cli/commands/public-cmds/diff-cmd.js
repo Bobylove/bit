@@ -10,13 +10,14 @@ export default class Diff extends Command {
   bit diff => compare all modified components to their model version
   bit diff [ids...] => compare the specified components against their modified states
   bit diff [id] [version] => compare the specified version to used or modified files
-  bit diff [id] [version] [to_version] => compare the specified version files to to_version files`;
+  bit diff [id] [version] [to_version] => compare the specified version files to to_version files
+  the id can be used with wildcards (e.g. bit diff "utils/*")`;
   alias = '';
-  opts = [];
+  opts = [['v', 'verbose', 'show a more verbose output when possible']];
   loader = true;
 
-  action([values]: [string[]]): Promise<DiffResults[]> {
-    return diff(values);
+  action([values]: [string[]], { verbose = false }: { verbose?: boolean }): Promise<DiffResults[]> {
+    return diff(values, verbose);
   }
 
   report(diffResults: DiffResults[]): string {

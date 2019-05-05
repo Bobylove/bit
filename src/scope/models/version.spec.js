@@ -1,6 +1,6 @@
 import R from 'ramda';
 import { expect } from 'chai';
-import Version from '../../../src/scope/models/version';
+import Version from '../../scope/models/version';
 import versionFixture from '../../../fixtures/version-model-object.json';
 import versionWithDepsFixture from '../../../fixtures/version-model-extended.json';
 
@@ -58,11 +58,23 @@ describe('Version', () => {
       it('should not have devDependencies property', () => {
         expect(idParsed).to.not.haveOwnProperty('devDependencies');
       });
+      it('should not have compilerDependencies property', () => {
+        expect(idParsed).to.not.haveOwnProperty('compilerDependencies');
+      });
+      it('should not have testerDependencies property', () => {
+        expect(idParsed).to.not.haveOwnProperty('testerDependencies');
+      });
       it('should not have flattenedDependencies property', () => {
         expect(idParsed).to.not.haveOwnProperty('flattenedDependencies');
       });
       it('should not have flattenedDevDependencies property', () => {
         expect(idParsed).to.not.haveOwnProperty('flattenedDevDependencies');
+      });
+      it('should not have flattenedCompilerDependencies property', () => {
+        expect(idParsed).to.not.haveOwnProperty('flattenedCompilerDependencies');
+      });
+      it('should not have flattenedTesterDependencies property', () => {
+        expect(idParsed).to.not.haveOwnProperty('flattenedTesterDependencies');
       });
       it('should not have devPackageDependencies property', () => {
         expect(idParsed).to.not.haveOwnProperty('devPackageDependencies');
@@ -196,12 +208,12 @@ describe('Version', () => {
       expect(validateFunc).to.throw('missing the name attribute');
     });
     it('if a compiler is string, it should be a valid bit-id', () => {
-      version.compiler = 'this/is/invalid/bit/id';
+      version.compiler = 'this/is\\invalid?!/bit/id';
       expect(validateFunc).to.throw('the environment-id has an invalid Bit id');
     });
-    it('if a compiler is string, it should have scope ', () => {
+    it('if a compiler is string, it should have scope', () => {
       version.compiler = 'name@0.0.1';
-      expect(validateFunc).to.throw('does not have a scope');
+      expect(validateFunc).to.throw('the environment-id has an invalid Bit id');
     });
     // it('if a compiler is string, it should have version', () => {
     //   version.compiler = 'scope/box/name';
@@ -255,6 +267,14 @@ describe('Version', () => {
       version.devDependencies = {};
       expect(validateFunc).to.throw('devDependencies must be an instance of Dependencies, got object');
     });
+    it('should throw when compilerDependencies are invalid', () => {
+      version.compilerDependencies = {};
+      expect(validateFunc).to.throw('compilerDependencies must be an instance of Dependencies, got object');
+    });
+    it('should throw when testerDependencies are invalid', () => {
+      version.testerDependencies = {};
+      expect(validateFunc).to.throw('testerDependencies must be an instance of Dependencies, got object');
+    });
     it('should throw when there are dependencies and the flattenDependencies are empty', () => {
       version.flattenedDependencies = [];
       expect(validateFunc).to.throw('it has dependencies but its flattenedDependencies is empty');
@@ -264,7 +284,7 @@ describe('Version', () => {
       expect(validateFunc).to.throw('expected to be BitId, got number');
     });
     it('should throw when a flattenDependency does not have a version', () => {
-      version.flattenedDependencies[0].version = null;
+      version.flattenedDependencies[0] = version.flattenedDependencies[0].changeVersion(null);
       expect(validateFunc).to.throw('does not have a version');
     });
     it('should throw when the log is empty', () => {

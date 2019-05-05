@@ -1,17 +1,18 @@
 /** @flow */
-import { contains, isBitUrl, cleanBang } from '../utils';
-import ComponentObjects from '../scope/component-objects';
+import { isBitUrl, cleanBang } from '../utils';
+import type ComponentObjects from '../scope/component-objects';
 import { connect } from '../scope/network';
 import { InvalidRemote } from './exceptions';
-import { BitId } from '../bit-id';
+import { BitId, BitIds } from '../bit-id';
 import type { Network } from '../scope/network/network';
-import Component from '../consumer/component';
+import type Component from '../consumer/component/consumer-component';
+import type { ListScopeResult } from '../consumer/component/components-list';
 
 /**
  * @ctx bit, primary, remote
  */
 function isPrimary(alias: string): boolean {
-  return contains(alias, '!');
+  return alias.includes('!');
 }
 
 export default class Remote {
@@ -42,7 +43,7 @@ export default class Remote {
     });
   }
 
-  list(): Promise<[]> {
+  list(): Promise<ListScopeResult[]> {
     return this.connect().then(network => network.list());
   }
 
@@ -54,7 +55,7 @@ export default class Remote {
     return this.connect().then(network => network.show(bitId));
   }
 
-  fetch(bitIds: BitId[], withoutDeps: boolean, context: ?Object): Promise<ComponentObjects[]> {
+  fetch(bitIds: BitIds, withoutDeps: boolean, context: ?Object): Promise<ComponentObjects[]> {
     return this.connect().then(network => network.fetch(bitIds, withoutDeps, context));
   }
 
@@ -70,14 +71,14 @@ export default class Remote {
     return connect(this.host).then(network => network.push(componentObjects));
   }
 
-  pushMany(components: ComponentObjects[], context: ?Object): Promise<ComponentObjects[]> {
+  pushMany(components: ComponentObjects[], context: ?Object): Promise<string[]> {
     return connect(this.host).then(network => network.pushMany(components, context));
   }
-  deleteMany(bitIds: Array<BitIds>, force: boolean, context: ?Object): Promise<Object[]> {
-    return connect(this.host).then(network => network.deleteMany(bitIds, force, context));
+  deleteMany(ids: string[], force: boolean, context: ?Object): Promise<Object[]> {
+    return connect(this.host).then(network => network.deleteMany(ids, force, context));
   }
-  deprecateMany(bitIds: BitIds[], context: ?Object): Promise<Object[]> {
-    return connect(this.host).then(network => network.deprecateMany(bitIds, context));
+  deprecateMany(ids: string[], context: ?Object): Promise<Object[]> {
+    return connect(this.host).then(network => network.deprecateMany(ids, context));
   }
 
   static load(name: string, host: string): Remote {

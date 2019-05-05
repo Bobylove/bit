@@ -1,6 +1,7 @@
 /** @flow */
 import type { PathLinux, PathOsBased } from '../../utils/path';
 import { pathNormalizeToLinux } from '../../utils';
+import { BitId } from '../../bit-id';
 
 type ErrorObj = {
   message: string,
@@ -54,7 +55,12 @@ export type RawTestsResults = {
   specPath: PathOsBased
 };
 
-export type SpecsResultsWithComponentId = Array<{ componentId: string, specs: SpecsResults }>;
+export type SpecsResultsWithComponentId = Array<{
+  componentId: BitId,
+  specs: SpecsResults,
+  missingTester?: boolean,
+  pass: boolean
+}>;
 
 export default class SpecsResults {
   tests: Test[];

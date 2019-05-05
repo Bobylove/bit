@@ -4,6 +4,7 @@ let logger;
 const tester = {
   init: ({ rawConfig, dynamicConfig, api }) => {
     logger = api.getLogger();
+    return { write: true };
   },
   getDynamicConfig: ({ rawConfig }) => {
     const dynamicConfig = Object.assign({}, rawConfig);
@@ -27,9 +28,12 @@ const tester = {
     api,
     context
   }) => {
+    let config = {};
     const configFile = getFileByName('config', configFiles);  
-    const rawConfigFile = configFile.contents.toString();
-    const config = JSON.parse(rawConfigFile);
+    if (configFile) {
+      const rawConfigFile = configFile.contents.toString();
+      config = JSON.parse(rawConfigFile);
+    }
     // This is not a good idea to get it from external file
     // it's here only to tests that the files passed correctly
     const reporter = config.reporter || JSONReporter;

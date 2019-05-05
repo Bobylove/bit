@@ -17,9 +17,9 @@ export function flattenDependencies(dependencies: ComponentWithDependencies[]) {
 export function flattenDependencyIds(dependencies: VersionDependencies[], repo: Repository): Promise<BitId[]> {
   return Promise.all(
     dependencies.map((dep) => {
-      const depCompId = dep.component.id;
-      depCompId.scope = dep.sourceScope;
-      return dep.component.flattenedDependencies(repo).then(flattnedDeps => flattnedDeps.concat(depCompId));
+      // $FlowFixMe
+      const depCompId = dep.component.id.changeScope(dep.sourceScope);
+      return dep.component.flattenedDependencies(repo).then(flattenedDeps => flattenedDeps.concat(depCompId));
     })
   ).then((idMatrix) => {
     const ids = flatten(idMatrix);

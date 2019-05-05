@@ -1,25 +1,21 @@
 // @flow
 import path from 'path';
 import fs from 'fs-extra';
+import pMapSeries from 'p-map-series';
 import { BitId } from '../../bit-id';
 import { Consumer } from '..';
-import Component from '../component';
+import ConsumerComponent from '../component';
 import { COMPONENT_ORIGINS } from '../../constants';
 import { pathNormalizeToLinux } from '../../utils/path';
 import type { PathOsBased } from '../../utils/path';
 import Version from '../../scope/models/version';
 import { SourceFile } from '../component/sources';
-import {
-  getMergeStrategyInteractive,
-  FileStatus,
-  MergeOptions,
-  threeWayMerge,
-  filesStatusWithoutSharedDir
-} from './merge-version';
+import { getMergeStrategyInteractive, FileStatus, MergeOptions, threeWayMerge } from './merge-version';
 import type { MergeStrategy, ApplyVersionResults, ApplyVersionResult, FailedComponents } from './merge-version';
 import type { MergeResultsThreeWay } from './merge-version/three-way-merge';
 import GeneralError from '../../error/general-error';
-import writeComponents from '../component-ops/write-components';
+import ManyComponentsWriter from '../component-ops/many-components-writer';
+import { Tmp } from '../../scope/repositories';
 
 export type CheckoutProps = {
   version?: string, // if reset is true, the version is undefined
@@ -34,8 +30,8 @@ export type CheckoutProps = {
   ignoreDist: boolean
 };
 type ComponentStatus = {
-  componentFromFS?: Component,
-  componentFromModel?: Component,
+  componentFromFS?: ConsumerComponent,
+  componentFromModel?: Version,
   id: BitId,
   failureMessage?: string,
   mergeResults?: ?MergeResultsThreeWay
@@ -47,11 +43,8 @@ export default (async function checkoutVersion(
 ): Promise<ApplyVersionResults> {
   const { version, ids, promptMergeOptions } = checkoutProps;
   const { components } = await consumer.loadComponents(ids);
-  const allComponentsP = components.map((component: Component) => {
-    return getComponentStatus(consumer, component, checkoutProps);
-  });
-  const allComponents: ComponentStatus[] = await Promise.all(allComponentsP);
-  const componentWithConflict = allComponents.find(
+  const allComponentsStatus: ComponentStatus[] = await getAllComponentsStatus();
+  const componentWithConflict = allComponentsStatus.find(
     component => component.mergeResults && component.mergeResults.hasConflicts
   );
   if (componentWithConflict) {
@@ -62,22 +55,37 @@ export default (async function checkoutVersion(
     }
     if (!checkoutProps.mergeStrategy) checkoutProps.mergeStrategy = await getMergeStrategyInteractive();
   }
-  const failedComponents: FailedComponents[] = allComponents
+  const failedComponents: FailedComponents[] = allComponentsStatus
     .filter(componentStatus => componentStatus.failureMessage) // $FlowFixMe componentStatus.failureMessage is set
     .map(componentStatus => ({ id: componentStatus.id, failureMessage: componentStatus.failureMessage }));
-  const componentsResultsP = allComponents
-    .filter(componentStatus => !componentStatus.failureMessage)
-    .map(({ id, componentFromFS, mergeResults }) => {
-      return applyVersion(consumer, id, componentFromFS, mergeResults, checkoutProps);
-    });
-  const componentsResults = await Promise.all(componentsResultsP);
+
+  const succeededComponents = allComponentsStatus.filter(componentStatus => !componentStatus.failureMessage);
+  // do not use Promise.all for applyVersion. otherwise, it'll write all components in parallel,
+  // which can be an issue when some components are also dependencies of others
+  const componentsResults = await pMapSeries(succeededComponents, ({ id, componentFromFS, mergeResults }) => {
+    return applyVersion(consumer, id, componentFromFS, mergeResults, checkoutProps);
+  });
 
   return { components: componentsResults, version, failedComponents };
+
+  async function getAllComponentsStatus(): Promise<ComponentStatus[]> {
+    const tmp = new Tmp(consumer.scope);
+    try {
+      const componentsStatus = await Promise.all(
+        components.map(component => getComponentStatus(consumer, component, checkoutProps))
+      );
+      await tmp.clear();
+      return componentsStatus;
+    } catch (err) {
+      await tmp.clear();
+      throw err;
+    }
+  }
 });
 
 async function getComponentStatus(
   consumer: Consumer,
-  component: Component,
+  component: ConsumerComponent,
   checkoutProps: CheckoutProps
 ): Promise<ComponentStatus> {
   const { version, latestVersion, reset } = checkoutProps;
@@ -99,8 +107,8 @@ async function getComponentStatus(
   if (version && !latestVersion && !componentModel.hasVersion(version)) {
     return returnFailure(`component ${component.id.toStringWithoutVersion()} doesn't have version ${version}`);
   }
-  const existingBitMapId = consumer.bitMap.getExistingComponentId(component.id.toStringWithoutVersion());
-  const currentlyUsedVersion = BitId.parse(existingBitMapId).version;
+  const existingBitMapId = consumer.bitMap.getBitId(component.id, { ignoreVersion: true });
+  const currentlyUsedVersion = existingBitMapId.version;
   if (version && currentlyUsedVersion === version) {
     // it won't be relevant for 'reset' as it doesn't have a version
     return returnFailure(`component ${component.id.toStringWithoutVersion()} is already at version ${version}`);
@@ -110,14 +118,16 @@ async function getComponentStatus(
       `component ${component.id.toStringWithoutVersion()} is already at the latest version, which is ${newVersion}`
     );
   }
-  const baseComponent: Version = await componentModel.loadVersion(currentlyUsedVersion, consumer.scope.objects);
-  const isModified = await consumer.isComponentModified(baseComponent, component);
+  const baseComponentVersion: Version = await componentModel.loadVersion(currentlyUsedVersion, consumer.scope.objects);
+  const baseComponent: ConsumerComponent = await consumer.loadComponentFromModel(existingBitMapId);
+  const isModified = await consumer.isComponentModified(baseComponentVersion, component);
   if (!isModified && reset) {
     return returnFailure(`component ${component.id.toStringWithoutVersion()} is not modified`);
   }
   let mergeResults: ?MergeResultsThreeWay;
   if (isModified && version) {
-    const currentComponent: Version = await componentModel.loadVersion(newVersion, consumer.scope.objects);
+    const newBitId = component.id.changeVersion(newVersion);
+    const currentComponent: ConsumerComponent = await consumer.loadComponentFromModel(newBitId);
     mergeResults = await threeWayMerge({
       consumer,
       otherComponent: component,
@@ -129,8 +139,7 @@ async function getComponentStatus(
   }
   const versionRef = componentModel.versions[newVersion];
   const componentVersion = await consumer.scope.getObject(versionRef.hash);
-  const newId = component.id.clone();
-  newId.version = newVersion;
+  const newId = component.id.changeVersion(newVersion);
   return { componentFromFS: component, componentFromModel: componentVersion, id: newId, mergeResults };
 }
 
@@ -154,7 +163,7 @@ async function getComponentStatus(
 async function applyVersion(
   consumer: Consumer,
   id: BitId,
-  componentFromFS: Component,
+  componentFromFS: ConsumerComponent,
   mergeResults: ?MergeResultsThreeWay,
   checkoutProps: CheckoutProps
 ): Promise<ApplyVersionResult> {
@@ -165,16 +174,16 @@ async function applyVersion(
       filesStatus[pathNormalizeToLinux(file.relative)] = FileStatus.unchanged;
     });
     consumer.bitMap.updateComponentId(id);
-    consumer.bitMap.hasChanged = true;
     return { id, filesStatus };
   }
-  const componentsWithDependencies = await consumer.scope.getMany([id]);
-  const componentWithDependencies = componentsWithDependencies[0];
+  const componentWithDependencies = await consumer.loadComponentWithDependenciesFromModel(id);
   const componentMap = componentFromFS.componentMap;
   if (!componentMap) throw new GeneralError('applyVersion: componentMap was not found');
   if (componentMap.origin === COMPONENT_ORIGINS.AUTHORED && !id.scope) {
     componentWithDependencies.dependencies = [];
     componentWithDependencies.devDependencies = [];
+    componentWithDependencies.compilerDependencies = [];
+    componentWithDependencies.testerDependencies = [];
     componentWithDependencies.allDependencies = [];
   }
   const rootDir = componentMap.rootDir;
@@ -197,47 +206,43 @@ async function applyVersion(
   let modifiedStatus = {};
   if (mergeResults) {
     // update files according to the merge results
-    modifiedStatus = await applyModifiedVersion(files, mergeResults, mergeStrategy);
+    modifiedStatus = applyModifiedVersion(files, mergeResults, mergeStrategy);
   }
+  const shouldDependenciesSaveAsComponents = await consumer.shouldDependenciesSavedAsComponents([id]);
+  componentWithDependencies.component.dependenciesSavedAsComponents =
+    shouldDependenciesSaveAsComponents[0].saveDependenciesAsComponents;
 
-  await writeComponents({
+  const manyComponentsWriter = new ManyComponentsWriter({
     consumer,
-    componentsWithDependencies,
+    componentsWithDependencies: [componentWithDependencies],
     installNpmPackages: shouldInstallNpmPackages(),
     override: true,
-    writeBitJson: !!componentFromFS.bitJson, // write bit.json only if it was there before
+    writeConfig: Boolean(componentMap.configDir), // write bit.json and config files only if it was there before
+    configDir: componentMap.configDir,
     verbose,
     writeDists: !ignoreDist,
     writePackageJson
   });
+  await manyComponentsWriter.writeAll();
 
-  const filesStatusNoSharedDir = filesStatusWithoutSharedDir(
-    filesStatus,
-    componentWithDependencies.component,
-    componentMap
-  );
-  const modifiedStatusNoSharedDir = filesStatusWithoutSharedDir(
-    modifiedStatus,
-    componentWithDependencies.component,
-    componentMap
-  );
-
-  return { id, filesStatus: Object.assign(filesStatusNoSharedDir, modifiedStatusNoSharedDir) };
+  return { id, filesStatus: Object.assign(filesStatus, modifiedStatus) };
 }
 
 /**
  * relevant only when
  * 1) there is no conflict => add files from mergeResults: addFiles, overrideFiles and modifiedFiles.output.
  * 2) there is conflict and mergeStrategy is manual => add files from mergeResults: addFiles, overrideFiles and modifiedFiles.conflict.
+ *
+ * this function only updates the files content, it doesn't write the files
  */
-export async function applyModifiedVersion(
+export function applyModifiedVersion(
   componentFiles: SourceFile[],
   mergeResults: MergeResultsThreeWay,
   mergeStrategy: ?MergeStrategy
-): Promise<Object> {
+): Object {
   const filesStatus = {};
   if (mergeResults.hasConflicts && mergeStrategy !== MergeOptions.manual) return filesStatus;
-  const modifiedP = mergeResults.modifiedFiles.map(async (file) => {
+  mergeResults.modifiedFiles.forEach((file) => {
     const filePath: PathOsBased = path.normalize(file.filePath);
     const foundFile = componentFiles.find(componentFile => componentFile.relative === filePath);
     if (!foundFile) throw new GeneralError(`file ${filePath} not found`);
@@ -251,18 +256,17 @@ export async function applyModifiedVersion(
       throw new GeneralError('file does not have output nor conflict');
     }
   });
-  const addFilesP = mergeResults.addFiles.map(async (file) => {
+  mergeResults.addFiles.forEach((file) => {
     componentFiles.push(file.fsFile);
     filesStatus[file.filePath] = FileStatus.added;
   });
-  const overrideFilesP = mergeResults.overrideFiles.map(async (file) => {
+  mergeResults.overrideFiles.forEach((file) => {
     const filePath: PathOsBased = path.normalize(file.filePath);
     const foundFile = componentFiles.find(componentFile => componentFile.relative === filePath);
     if (!foundFile) throw new GeneralError(`file ${filePath} not found`);
     foundFile.contents = file.fsFile.contents;
     filesStatus[file.filePath] = FileStatus.overridden;
   });
-  await Promise.all([Promise.all(modifiedP), Promise.all(addFilesP), Promise.all(overrideFilesP)]);
 
   return filesStatus;
 }

@@ -3,10 +3,12 @@ import c from 'chalk';
 import R from 'ramda';
 import semver from 'semver';
 import Table from 'tty-table';
-import ConsumerComponent from '../../consumer/component/consumer-component';
-import { BitId } from '../../bit-id';
+import { removeChalkCharacters } from '../../utils';
+import type { ListScopeResult } from '../../consumer/component/components-list';
 
-export default (components: ConsumerComponent[], json: boolean, showRemoteVersion?: boolean = false) => {
+type Row = { id: string, localVersion: string, currentVersion: string, remoteVersion?: string };
+
+export default (listScopeResults: ListScopeResult[], json: boolean, showRemoteVersion: boolean) => {
   const header = [
     { value: 'component ID', width: 70, headerColor: 'cyan', headerAlign: 'left' },
     {
@@ -24,33 +26,49 @@ export default (components: ConsumerComponent[], json: boolean, showRemoteVersio
     align: 'left'
   };
 
-  function tablizeComponent(component: ConsumerComponent) {
-    const id = component.id.toStringWithoutVersion();
-    const data = { id: c.white(`${id}${component.deprecated ? ' [Deprecated]' : ''}`) }; // Add date, author
-    let version = component.version;
+  function tabulateComponent(listScopeResult: ListScopeResult): Row {
+    const id = listScopeResult.id.toStringWithoutVersion();
+    let version = listScopeResult.id.version;
     if (!json && showRemoteVersion) {
-      const color = component.latest && semver.gt(component.latest, component.version) ? 'red' : null;
+      const color = listScopeResult.remoteVersion && semver.gt(listScopeResult.remoteVersion, version) ? 'red' : null;
       version = color ? c[color](version) : version;
     }
-    const getCurrentlyUsedVersion = () => {
-      if (!component.currentlyUsedVersion) return 'N/A';
-      const bitId = BitId.parse(component.currentlyUsedVersion);
-      if (!bitId.hasVersion()) return 'N/A';
-      return bitId.version;
+    const data: Row = {
+      id: c.white(`${id}${listScopeResult.deprecated ? ' [Deprecated]' : ''}`),
+      localVersion: version,
+      currentVersion: listScopeResult.currentlyUsedVersion || 'N/A'
     };
-    data.localVersion = version;
-    data.currentVersion = getCurrentlyUsedVersion();
+
     if (showRemoteVersion) {
-      let remoteVersion = component.latest || 'N/A';
-      const color = component.latest && semver.gt(component.version, component.latest) ? 'red' : null;
+      let remoteVersion = listScopeResult.remoteVersion || 'N/A';
+      const color =
+        listScopeResult.remoteVersion && semver.gt(listScopeResult.id.version, listScopeResult.remoteVersion)
+          ? 'red'
+          : null;
       remoteVersion = color ? c[color](remoteVersion) : remoteVersion;
       data.remoteVersion = remoteVersion;
     }
     return data;
   }
 
-  const rows = components.map(tablizeComponent);
-  if (json) return JSON.stringify(rows);
+  function toJsonComponent(listScopeResult: ListScopeResult): Object {
+    const id = listScopeResult.id.toStringWithoutVersion();
+    const version = listScopeResult.id.version;
+    const data = {
+      id,
+      localVersion: version,
+      deprecated: listScopeResult.deprecated,
+      currentVersion: listScopeResult.currentlyUsedVersion || 'N/A',
+      remoteVersion: listScopeResult.remoteVersion || 'N/A'
+    };
+    return data;
+  }
+
+  if (json) {
+    const jsonResults = listScopeResults.map(toJsonComponent);
+    return JSON.stringify(jsonResults, null, 2);
+  }
+  const rows = listScopeResults.map(tabulateComponent);
 
   const table = new Table(header, rows.map(row => R.values(row)), opts);
   return table.render();

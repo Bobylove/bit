@@ -10,8 +10,11 @@ import fs from 'fs-extra';
 import json from 'comment-json';
 import { expect } from 'chai';
 import set from 'lodash.set';
-import { VERSION_DELIMITER, BIT_VERSION, BIT_MAP } from '../src/constants';
+import { VERSION_DELIMITER, BIT_VERSION, BIT_MAP, BASE_WEB_DOMAIN, CFG_GIT_EXECUTABLE_PATH } from '../src/constants';
 import defaultErrorHandler from '../src/cli/default-error-handler';
+import * as fixtures from './fixtures/fixtures';
+import { NOTHING_TO_TAG_MSG } from '../src/cli/commands/public-cmds/tag-cmd';
+import { removeChalkCharacters } from '../src/utils';
 
 const generateRandomStr = (size: number = 8): string => {
   return Math.random()
@@ -33,12 +36,12 @@ export default class Helper {
   cache: Object;
   clonedScopes: string[] = [];
   keepEnvs: boolean;
+  externalDirsArray: string[] = [];
   constructor() {
     this.debugMode = !!process.env.npm_config_debug; // default = false
-    this.remoteScope = `${generateRandomStr()}-remote`;
     this.e2eDir = path.join(os.tmpdir(), 'bit', 'e2e');
     this.setLocalScope();
-    this.remoteScopePath = path.join(this.e2eDir, this.remoteScope);
+    this.setRemoteScope();
     this.bitBin = process.env.npm_config_bit_bin || 'bit'; // e.g. npm run e2e-test --bit_bin=bit-dev
     this.envScope = `${generateRandomStr()}-env`;
     this.envScopePath = path.join(this.e2eDir, this.envScope);
@@ -56,6 +59,16 @@ export default class Helper {
     return cmdOutput.toString();
   }
 
+  parseOptions(options: Object): string {
+    const value = Object.keys(options)
+      .map((key) => {
+        const keyStr = key.length === 1 ? `-${key}` : `--${key}`;
+        return `${keyStr} ${options[key]}`;
+      })
+      .join(' ');
+    return value;
+  }
+
   runWithTryCatch(cmd: string, cwd: string = this.localScopePath) {
     let output;
     try {
@@ -66,9 +79,11 @@ export default class Helper {
     return output;
   }
 
-  static removeChalkCharacters(str?: ?string): ?string {
+  static alignOutput(str?: ?string): ?string {
     if (!str) return str;
-    return str.replace(/\u001b\[.*?m/g, '');
+    // on Mac the directory '/var' is sometimes shown as '/private/var'
+    // $FlowFixMe
+    return removeChalkCharacters(str).replace(/\/private\/var/g, '/var');
   }
 
   expectToThrow(cmdFunc: Function, error: Error) {
@@ -78,14 +93,9 @@ export default class Helper {
     } catch (err) {
       output = err.toString();
     }
-    const alignOutput = (str) => {
-      if (!str) return str;
-      // on Mac the directory '/var' is sometimes shown as '/private/var'
-      // $FlowFixMe
-      return Helper.removeChalkCharacters(str).replace('/private/var/', '/var/');
-    };
+
     const errorString = defaultErrorHandler(error);
-    expect(alignOutput(output)).to.have.string(alignOutput(errorString));
+    expect(Helper.alignOutput(output)).to.have.string(Helper.alignOutput(errorString));
   }
   cleanEnv() {
     fs.emptyDirSync(this.localScopePath);
@@ -103,6 +113,21 @@ export default class Helper {
     if (this.clonedScopes && this.clonedScopes.length) {
       this.clonedScopes.forEach(scopePath => fs.removeSync(scopePath));
     }
+    this.externalDirsArray.forEach((dirPath) => {
+      this.cleanDir(dirPath);
+    });
+  }
+
+  createNewDirectory() {
+    const newDir = `${generateRandomStr()}-dir`;
+    const newDirPath = path.join(this.e2eDir, newDir);
+    fs.ensureDirSync(newDirPath);
+    this.externalDirsArray.push(newDirPath);
+    return newDirPath;
+  }
+
+  cleanDir(dirPath: string) {
+    fs.removeSync(dirPath);
   }
 
   getRequireBitPath(box: string, name: string) {
@@ -114,13 +139,33 @@ export default class Helper {
   }
   // #endregion
 
+  // #region npm utils
+
+  initNpm(initPath: string = path.join(this.localScopePath)) {
+    this.runCmd('npm init -y', initPath);
+  }
+
+  nodeStart(mainFilePath: string, cwd?: string) {
+    return this.runCmd(`node ${mainFilePath}`, cwd);
+  }
+
+  npmLink(libraryName: string, cwd: string = process.cwd()) {
+    return this.runCmd(`npm link ${libraryName}`, cwd);
+  }
+  // #endregion
+
   // #region scopes utils (init, remote etc')
+
   setLocalScope(localScope?: string) {
     this.localScope = localScope || `${generateRandomStr()}-local`;
     this.localScopePath = path.join(this.e2eDir, this.localScope);
     if (!fs.existsSync(this.localScopePath)) {
       fs.ensureDirSync(this.localScopePath);
     }
+  }
+  setRemoteScope() {
+    this.remoteScope = `${generateRandomStr()}-remote`;
+    this.remoteScopePath = path.join(this.e2eDir, this.remoteScope);
   }
   cleanLocalScope() {
     fs.emptyDirSync(this.localScopePath);
@@ -183,6 +228,10 @@ export default class Helper {
     return this.runCmd(`bit remote add file://${remoteScopePath}`, localScopePath);
   }
 
+  removeRemoteScope(remoteScope: string = this.remoteScope) {
+    return this.runCmd(`bit remote del ${remoteScope}`);
+  }
+
   addRemoteEnvironment() {
     return this.runCmd(`bit remote add file://${this.envScopePath}`, this.localScopePath);
   }
@@ -190,6 +239,17 @@ export default class Helper {
   reInitRemoteScope() {
     fs.emptyDirSync(this.remoteScopePath);
     return this.runCmd('bit init --bare', this.remoteScopePath);
+  }
+
+  /**
+   * useful when publishing to a local npm registry so then multiple tests in the same file
+   * won't collide in the @ci registry
+   */
+  setRemoteScopeAsDifferentDir() {
+    fs.removeSync(this.remoteScopePath);
+    this.setRemoteScope();
+    this.reInitRemoteScope();
+    this.addRemoteScope();
   }
 
   reInitEnvsScope() {
@@ -205,6 +265,10 @@ export default class Helper {
   }
   listLocalScopeParsed(options: string = '') {
     const output = this.runCmd(`bit list --json ${options}`);
+    return JSON.parse(output);
+  }
+  listRemoteScopeParsed(options: string = '') {
+    const output = this.runCmd(`bit list ${this.remoteScope} --json ${options}`);
     return JSON.parse(output);
   }
 
@@ -230,8 +294,12 @@ export default class Helper {
     return clonedScopePath;
   }
 
-  getClonedLocalScope(clonedScopePath: string) {
-    fs.removeSync(this.localScopePath);
+  getClonedLocalScope(clonedScopePath: string, deleteCurrentScope: boolean = true) {
+    if (deleteCurrentScope) {
+      fs.removeSync(this.localScopePath);
+    } else {
+      this.setLocalScope();
+    }
     if (this.debugMode) console.log(`cloning a scope from ${clonedScopePath} to ${this.localScopePath}`);
     fs.copySync(clonedScopePath, this.localScopePath);
   }
@@ -245,8 +313,12 @@ export default class Helper {
     return clonedScopePath;
   }
 
-  getClonedRemoteScope(clonedScopePath: string) {
-    fs.removeSync(this.remoteScopePath);
+  getClonedRemoteScope(clonedScopePath: string, deleteCurrentScope: boolean = true) {
+    if (deleteCurrentScope) {
+      fs.removeSync(this.remoteScopePath);
+    } else {
+      this.getNewBareScope();
+    }
     if (this.debugMode) console.log(`cloning a scope from ${clonedScopePath} to ${this.remoteScopePath}`);
     fs.copySync(clonedScopePath, this.remoteScopePath);
   }
@@ -258,14 +330,27 @@ export default class Helper {
       .sync(path.normalize(`**/${ext}`), { cwd: this.localScopePath, dot: includeDot })
       .map(x => path.normalize(x));
   }
-  createFile(folder: string = 'bar', name: string = 'foo.js', impl?: string) {
-    const fixture = impl || "module.exports = function foo() { return 'got foo'; };";
+  createFile(folder: string, name: string, impl?: string = fixtures.fooFixture) {
     const filePath = path.join(this.localScopePath, folder, name);
-    fs.outputFileSync(filePath, fixture);
+    fs.outputFileSync(filePath, impl);
   }
 
-  readFile(filePath: string): string {
-    return fs.readFileSync(path.join(this.localScopePath, filePath)).toString();
+  createJsonFile(filePathRelativeToLocalScope: string, jsonContent: string) {
+    const filePath = path.join(this.localScopePath, filePathRelativeToLocalScope);
+    ensureAndWriteJson(filePath, jsonContent);
+  }
+
+  createFileOnRootLevel(name: string = 'foo.js', impl?: string = fixtures.fooFixture) {
+    const filePath = path.join(this.localScopePath, name);
+    fs.outputFileSync(filePath, impl);
+  }
+
+  readFile(filePathRelativeToLocalScope: string): string {
+    return fs.readFileSync(path.join(this.localScopePath, filePathRelativeToLocalScope)).toString();
+  }
+
+  readJsonFile(filePathRelativeToLocalScope: string): string {
+    return fs.readJsonSync(path.join(this.localScopePath, filePathRelativeToLocalScope));
   }
 
   /**
@@ -282,8 +367,9 @@ export default class Helper {
   // #endregion
 
   // #region Bit commands
-  catScope() {
-    const result = this.runCmd('bit cat-scope --json');
+  catScope(includeExtraData: boolean = false) {
+    const extraData = includeExtraData ? '--json-extra' : '';
+    const result = this.runCmd(`bit cat-scope --json ${extraData}`);
     return JSON.parse(result);
   }
 
@@ -297,18 +383,14 @@ export default class Helper {
     const result = this.runCmd(`bit cat-component ${id}`, cwd);
     return JSON.parse(result);
   }
-  addComponent(filePaths: string = path.normalize('bar/foo.js'), cwd: string = this.localScopePath) {
-    return this.runCmd(`bit add ${filePaths}`, cwd);
+  addComponent(filePaths: string, options: Object = {}, cwd: string = this.localScopePath) {
+    const value = Object.keys(options)
+      .map(key => `-${key} ${options[key]}`)
+      .join(' ');
+    return this.runCmd(`bit add ${filePaths} ${value}`, cwd);
   }
-
   untrackComponent(id: string = '', all: boolean = false, cwd: string = this.localScopePath) {
     return this.runCmd(`bit untrack ${id} ${all ? '--all' : ''}`, cwd);
-  }
-  commitComponent(id: string, commitMsg: string = 'commit-message', options: string = '') {
-    return this.runCmd(`bit tag ${id} -m ${commitMsg} ${options}`);
-  }
-  tagWithoutMessage(id: string, version: string = '', options: string = '') {
-    return this.runCmd(`bit tag ${id} ${version} ${options}`);
   }
   removeComponent(id: string, flags: string = '') {
     return this.runCmd(`bit remove ${id} ${flags}`);
@@ -316,20 +398,39 @@ export default class Helper {
   deprecateComponent(id: string, flags: string = '') {
     return this.runCmd(`bit deprecate ${id} ${flags}`);
   }
-
-  commitAllComponents(commitMsg: string = 'commit-message', options: string = '', version: string = '') {
-    return this.runCmd(`bit tag ${options} -a ${version} -m ${commitMsg} `);
+  tagComponent(id: string, tagMsg: string = 'tag-message', options: string = '') {
+    return this.runCmd(`bit tag ${id} -m ${tagMsg} ${options}`);
   }
-  tagAllWithoutMessage(options: string = '', version: string = '') {
-    return this.runCmd(`bit tag -a ${version} ${options} `);
+  tagWithoutMessage(id: string, version: string = '', options: string = '') {
+    return this.runCmd(`bit tag ${id} ${version} ${options}`);
   }
-
-  tagScope(version: string, message: string = 'commit-message', options: string = '') {
+  tagAllComponents(options: string = '', version: string = '', assertTagged: boolean = true) {
+    const result = this.runCmd(`bit tag -a ${version} ${options} `);
+    if (assertTagged) expect(result).to.not.have.string(NOTHING_TO_TAG_MSG);
+    return result;
+  }
+  tagScope(version: string, message: string = 'tag-message', options: string = '') {
     return this.runCmd(`bit tag -s ${version} -m ${message} ${options}`);
   }
 
-  exportComponent(id: string, scope: string = this.remoteScope) {
-    return this.runCmd(`bit export ${scope} ${id}`);
+  untag(id: string) {
+    return this.runCmd(`bit untag ${id}`);
+  }
+
+  exportComponent(id: string, scope: string = this.remoteScope, assert: boolean = true) {
+    const result = this.runCmd(`bit export ${scope} ${id}`);
+    if (assert) expect(result).to.not.have.string('nothing to export');
+    return result;
+  }
+
+  ejectComponents(ids: string, flags?: string) {
+    return this.runCmd(`bit eject ${ids} ${flags || ''}`);
+  }
+  ejectComponentsParsed(ids: string, flags?: string) {
+    const result = this.runCmd(`bit eject ${ids} ${flags || ''} --json`);
+    const jsonStart = result.indexOf('{');
+    const jsonResult = result.substring(jsonStart);
+    return JSON.parse(jsonResult);
   }
 
   exportAllComponents(scope: string = this.remoteScope) {
@@ -338,6 +439,11 @@ export default class Helper {
 
   importComponent(id: string) {
     return this.runCmd(`bit import ${this.remoteScope}/${id}`);
+  }
+
+  importManyComponents(ids: string[]) {
+    const idsWithRemote = ids.map(id => `${this.remoteScope}/${id}`);
+    return this.runCmd(`bit import ${idsWithRemote.join(' ')}`);
   }
 
   importComponentWithOptions(id: string = 'bar/foo.js', options: ?Object) {
@@ -361,15 +467,38 @@ export default class Helper {
       id = `${this.envScope}/compilers/babel`;
       this.createCompiler();
     }
-    // Temporary - for checking new serializaion against the stage env
-    // this.setHubDomain('hub-stg.bitsrc.io');
+    // Temporary - for checking new serialization against the stage env
+    // this.setHubDomain(`hub-stg.${BASE_WEB_DOMAIN}`);
     return this.runCmd(`bit import ${id} --compiler`);
   }
 
   importTester(id) {
-    // Temporary - for checking new serializaion against the stage env
-    // this.setHubDomain('hub-stg.bitsrc.io');
+    // Temporary - for checking new serialization against the stage env
+    // this.setHubDomain(`hub-stg.${BASE_WEB_DOMAIN}`);
     this.runCmd(`bit import ${id} --tester`);
+  }
+
+  importExtension(id: string) {
+    return this.runCmd(`bit import ${id} --extension`);
+  }
+
+  importAndConfigureExtension(id: string) {
+    this.importExtension(id);
+    const bitJson = this.readBitJson();
+    bitJson.extensions = { [id]: {} };
+    this.writeBitJson(bitJson);
+  }
+
+  importNpmPackExtension(id: string = 'bit.extensions/npm/pack@2.0.1') {
+    this.importAndConfigureExtension(id);
+    // workaround to get the registry into the package.json file
+    const extensionFilePath = path.join(this.localScopePath, '.bit/components/npm/pack/bit.extensions/2.0.1/index.js');
+    const extensionFile = fs.readFileSync(extensionFilePath).toString();
+    const extensionFileIncludeRegistry = extensionFile.replace(
+      'excludeRegistryPrefix: true',
+      'excludeRegistryPrefix: false'
+    );
+    fs.writeFileSync(extensionFilePath, extensionFileIncludeRegistry);
   }
 
   build(id?: string = '') {
@@ -381,13 +510,6 @@ export default class Helper {
       .map(key => `-${key} ${options[key]}`)
       .join(' ');
     return this.runCmd(`bit build ${id} ${value}`, cwd);
-  }
-
-  addComponentWithOptions(filePaths: string = 'bar/foo.js', options: ?Object, cwd: string = this.localScopePath) {
-    const value = Object.keys(options)
-      .map(key => `-${key} ${options[key]}`)
-      .join(' ');
-    return this.runCmd(`bit add ${filePaths} ${value}`, cwd);
   }
 
   testComponent(id: string = '') {
@@ -407,6 +529,11 @@ export default class Helper {
 
   status() {
     return this.runCmd('bit status');
+  }
+
+  statusJson() {
+    const status = this.runCmd('bit status --json');
+    return JSON.parse(status);
   }
 
   showComponent(id: string = 'bar/foo') {
@@ -439,28 +566,100 @@ export default class Helper {
 
   diff(id?: string = '') {
     const output = this.runCmd(`bit diff ${id}`);
-    return Helper.removeChalkCharacters(output);
+    return removeChalkCharacters(output);
   }
 
   move(from: string, to: string) {
     return this.runCmd(`bit move ${path.normalize(from)} ${path.normalize(to)}`);
   }
-  setHubDomain(domain: string = 'hub.bitsrc.io') {
+  ejectConf(id: string = 'bar/foo', options: ?Object) {
+    const value = options
+      ? Object.keys(options)
+        .map(key => `-${key} ${options[key]}`)
+        .join(' ')
+      : '';
+    return this.runCmd(`bit eject-conf ${id} ${value}`);
+  }
+  injectConf(id: string = 'bar/foo', options: ?Object) {
+    const value = options
+      ? Object.keys(options)
+        .map(key => `-${key} ${options[key]}`)
+        .join(' ')
+      : '';
+    return this.runCmd(`bit inject-conf ${id} ${value}`);
+  }
+  setHubDomain(domain: string = `hub.${BASE_WEB_DOMAIN}`) {
     this.runCmd(`bit config set hub_domain ${domain}`);
   }
+
+  getGitPath() {
+    this.runCmd(`bit config get ${CFG_GIT_EXECUTABLE_PATH}`);
+  }
+
+  setGitPath(gitPath: string = 'git') {
+    this.runCmd(`bit config set ${CFG_GIT_EXECUTABLE_PATH} ${gitPath}`);
+  }
+
+  deleteGitPath() {
+    this.runCmd(`bit config del ${CFG_GIT_EXECUTABLE_PATH}`);
+  }
+
+  restoreGitPath(oldGitPath: ?string): any {
+    if (!oldGitPath) {
+      return this.deleteGitPath();
+    }
+    return this.setGitPath(oldGitPath);
+  }
+
   // #endregion
 
   // #region bit commands on templates (like add BarFoo / create compiler)
-  createComponentBarFoo(impl?: string) {
-    this.createFile(undefined, undefined, impl);
+  createComponentBarFoo(impl?: string = fixtures.fooFixture) {
+    this.createFile('bar', 'foo.js', impl);
+  }
+
+  createComponentUtilsIsType(impl?: string = fixtures.isType) {
+    this.createFile('utils', 'is-type.js', impl);
+  }
+
+  createComponentUtilsIsString(impl?: string = fixtures.isString) {
+    this.createFile('utils', 'is-string.js', impl);
   }
 
   addComponentBarFoo() {
-    return this.addComponent();
+    return this.runCmd('bit add bar/foo.js --id bar/foo');
   }
 
-  commitComponentBarFoo() {
-    return this.commitComponent('bar/foo');
+  addComponentUtilsIsType() {
+    return this.runCmd('bit add utils/is-type.js --id utils/is-type');
+  }
+
+  addComponentUtilsIsString() {
+    return this.runCmd('bit add utils/is-string.js --id utils/is-string');
+  }
+
+  tagComponentBarFoo() {
+    return this.tagComponent('bar/foo');
+  }
+
+  doctor(options: Object) {
+    const parsedOpts = this.parseOptions(options);
+    return this.runCmd(`bit doctor ${parsedOpts}`);
+  }
+
+  doctorOne(diagnosisName: string, options: Object) {
+    const parsedOpts = this.parseOptions(options);
+    return this.runCmd(`bit doctor ${diagnosisName} ${parsedOpts}`);
+  }
+
+  doctorList(options: Object) {
+    const parsedOpts = this.parseOptions(options);
+    return this.runCmd(`bit doctor --list ${parsedOpts}`);
+  }
+
+  doctorJsonParsed() {
+    const result = this.runCmd('bit doctor --json');
+    return JSON.parse(result);
   }
 
   createCompiler() {
@@ -513,95 +712,88 @@ export default class Helper {
   // #endregion
 
   // #region bit.json manipulation
-  addBitJsonDependencies(bitJsonPath: string, dependencies: Object, packageDependencies: Object) {
-    const bitJson = this.readBitJson(bitJsonPath);
-    bitJson.dependencies = bitJson.dependencies || {};
-    bitJson.packageDependencies = bitJson.packageDependencies || {};
-    Object.assign(bitJson.dependencies, dependencies);
-    Object.assign(bitJson.packageDependencies, packageDependencies);
-    fs.writeJSONSync(bitJsonPath, bitJson, { spaces: 2 });
-  }
-
-  readBitJson(bitJsonPath: string = path.join(this.localScopePath, 'bit.json')) {
+  readBitJson(bitJsonDir: string = this.localScopePath) {
+    const bitJsonPath = path.join(bitJsonDir, 'bit.json');
     return fs.existsSync(bitJsonPath) ? fs.readJSONSync(bitJsonPath) : {};
   }
-
-  addKeyValToBitJson(bitJsonPath: string = path.join(this.localScopePath, 'bit.json'), key: string, val: Any) {
-    const bitJson = this.readBitJson(bitJsonPath);
-    bitJson[key] = val;
-    fs.writeJSONSync(bitJsonPath, bitJson, { spaces: 2 });
+  writeBitJson(bitJson: Object, bitJsonDir: string = this.localScopePath) {
+    const bitJsonPath = path.join(bitJsonDir, 'bit.json');
+    return fs.writeJSONSync(bitJsonPath, bitJson, { spaces: 2 });
   }
-
+  addKeyValToBitJson(bitJsonDir: string = this.localScopePath, key: string, val: any) {
+    const bitJson = this.readBitJson(bitJsonDir);
+    bitJson[key] = val;
+    this.writeBitJson(bitJson, bitJsonDir);
+  }
+  addOverridesToBitJson(overrides: Object) {
+    const bitJson = this.readBitJson();
+    bitJson.overrides = overrides;
+    this.writeBitJson(bitJson);
+  }
   getEnvNameFromBitJsonByType(bitJson: Object, envType: 'compiler' | 'tester') {
     const env = bitJson.env[envType];
     const envName = typeof env === 'string' ? env : Object.keys(env)[0];
     return envName;
   }
-
   getEnvFromBitJsonByType(bitJson: Object, envType: 'compiler' | 'tester') {
     const basePath = ['env', envType];
     const env = R.path(basePath, bitJson);
     const envName = Object.keys(env)[0];
     return env[envName];
   }
-
   addKeyValToEnvPropInBitJson(
-    bitJsonPath: string = path.join(this.localScopePath, 'bit.json'),
+    bitJsonDir: string = this.localScopePath,
     propName: string,
     key: string,
     val: string,
     envType: 'compiler' | 'tester'
   ) {
-    const bitJson = this.readBitJson(bitJsonPath);
+    const bitJson = this.readBitJson(bitJsonDir);
     const envName = this.getEnvNameFromBitJsonByType(bitJson, envType);
     const propPath = ['env', envType, envName, propName];
     const prop = R.pathOr({}, propPath, bitJson);
     prop[key] = val;
     set(bitJson, propPath, prop);
-    fs.writeJSONSync(bitJsonPath, bitJson, { spaces: 2 });
+    this.writeBitJson(bitJson, bitJsonDir);
   }
-
   addFileToEnvInBitJson(
-    bitJsonPath: string = path.join(this.localScopePath, 'bit.json'),
+    bitJsonPath: string = this.localScopePath,
     fileName: string,
     filePath: string,
     envType: 'compiler' | 'tester'
   ) {
     this.addKeyValToEnvPropInBitJson(bitJsonPath, 'files', fileName, filePath, envType);
   }
-
   addToRawConfigOfEnvInBitJson(
-    bitJsonPath: string = path.join(this.localScopePath, 'bit.json'),
+    bitJsonPath: string = this.localScopePath,
     key: string,
     val: string,
     envType: 'compiler' | 'tester'
   ) {
     this.addKeyValToEnvPropInBitJson(bitJsonPath, 'rawConfig', key, val, envType);
   }
-  manageWorkspaces(withWorkspaces: boolean = true, bitJsonPath: string = path.join(this.localScopePath, 'bit.json')) {
-    const bitJson = this.readBitJson(bitJsonPath);
+  manageWorkspaces(withWorkspaces: boolean = true) {
+    const bitJson = this.readBitJson();
     bitJson.packageManager = 'yarn';
     bitJson.manageWorkspaces = withWorkspaces;
     bitJson.useWorkspaces = withWorkspaces;
     this.writeBitJson(bitJson);
   }
-  writeBitJson(bitJson: Object, bitJsonPath: string = path.join(this.localScopePath, 'bit.json')) {
-    return fs.writeJSONSync(bitJsonPath, bitJson, { spaces: 2 });
-  }
-  setComponentsDirInBitJson(content: string, bitJsonPath: string = path.join(this.localScopePath, 'bit.json')) {
-    const bitJson = this.readBitJson(bitJsonPath);
+  setComponentsDirInBitJson(content: string) {
+    const bitJson = this.readBitJson();
     bitJson.componentsDefaultDirectory = content;
     this.writeBitJson(bitJson);
   }
   corruptBitJson(bitJsonPath: string = path.join(this.localScopePath, 'bit.json')) {
-    const bitJson = this.readBitJson();
-    bitJson.corrupt = '"corrupted';
-    fs.writeFileSync(bitJsonPath, bitJson.toString());
+    fs.writeFileSync(bitJsonPath, '"corrupted');
   }
-  modifyFieldInBitJson(key: string, value: string, bitJsonPath: string = path.join(this.localScopePath, 'bit.json')) {
+  corruptPackageJson(packageJsonPath: string = path.join(this.localScopePath, 'package.json')) {
+    fs.writeFileSync(packageJsonPath, '{ corrupted');
+  }
+  modifyFieldInBitJson(key: string, value: string) {
     const bitJson = this.readBitJson();
     bitJson[key] = value;
-    fs.writeJsonSync(bitJsonPath, bitJson, { spaces: 2 });
+    this.writeBitJson(bitJson);
   }
   // #endregion
 
@@ -620,6 +812,9 @@ export default class Helper {
   writeBitMap(bitMap: Object) {
     const bitMapPath = path.join(this.localScopePath, BIT_MAP);
     return fs.writeJSONSync(bitMapPath, bitMap, { spaces: 2 });
+  }
+  deleteBitMap() {
+    return this.deleteFile(BIT_MAP);
   }
   createBitMap(
     cwd: string = this.localScopePath,
@@ -659,9 +854,6 @@ export default class Helper {
     fs.writeJSONSync(packageJsonPath, data, { spaces: 2 });
   }
 
-  initNpm(initPath: string = path.join(this.localScopePath)) {
-    this.runCmd('npm init -y', initPath);
-  }
   /**
    * install package, if you don't really need the package code and can use mock
    * just run addNpmPackage which will be faster
@@ -691,6 +883,10 @@ export default class Helper {
   readPackageJson(packageJsonFolder: string = this.localScopePath) {
     const packageJsonPath = path.join(packageJsonFolder, 'package.json');
     return fs.readJSONSync(packageJsonPath) || {};
+  }
+  writePackageJson(packageJson: Object, packageJsonFolder: string = this.localScopePath) {
+    const packageJsonPath = path.join(packageJsonFolder, 'package.json');
+    return fs.writeJSONSync(packageJsonPath, packageJson, { spaces: 2 });
   }
 
   readComponentPackageJson(id: string) {
@@ -754,6 +950,16 @@ export default class Helper {
     fs.copySync(sourceFile, distFile);
   }
   // #endregion
+
+  indexJsonPath() {
+    return path.join(this.localScopePath, '.bit/index.json');
+  }
+  getIndexJson() {
+    return fs.readJsonSync(this.indexJsonPath());
+  }
+  writeIndexJson(indexJson: Object) {
+    return ensureAndWriteJson(this.indexJsonPath(), indexJson);
+  }
 }
 
 function ensureAndWriteJson(filePath, fileContent) {

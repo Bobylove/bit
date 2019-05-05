@@ -1,8 +1,13 @@
 /** @flow */
+import * as Promise from 'bluebird';
 import loudRejection from 'loud-rejection';
 import buildRegistrar from './cli/command-registrar-builder';
 import loadExtensions from './extensions/extensions-loader';
 import HooksManager from './hooks';
+
+Promise.config({
+  longStackTraces: false // change it to true for easy debugging. by default, leave it as false for better performance
+});
 
 loudRejection();
 HooksManager.init();

@@ -1,13 +1,14 @@
 // @flow
 import R from 'ramda';
+import * as RA from 'ramda-adjunct';
 import chalk from 'chalk';
 import diff from 'object-diff';
 import normalize from 'normalize-path';
 import arrayDifference from 'array-difference';
 import Component from '../component/consumer-component';
 import type { FieldsDiff } from './components-diff';
-import { COMPONENT_ORIGINS } from '../../constants';
 import { Consumer } from '..';
+import EnvExtension from '../../extensions/env-extension';
 
 export function componentToPrintableForDiff(component: Component): Object {
   const obj = {};
@@ -16,38 +17,61 @@ export function componentToPrintableForDiff(component: Component): Object {
       ? Object.keys(packages).map(key => `${key}@${packages[key]}`)
       : null;
   };
+  const parseEnvFiles = (envExtension: ?EnvExtension): ?(string[]) => {
+    // $FlowFixMe sadly, Flow doesn't know what isNilOrEmpty does
+    if (RA.isNilOrEmpty(envExtension) || RA.isNilOrEmpty(envExtension.files)) return null;
+    // $FlowFixMe sadly, Flow doesn't know what isNilOrEmpty does
+    return envExtension.files.map(file => `${file.name} => ${file.relative}`).sort();
+  };
   const {
     lang,
     compiler,
     tester,
     dependencies,
     devDependencies,
+    compilerDependencies,
+    testerDependencies,
     packageDependencies,
     devPackageDependencies,
-    peerPackageDependencies,
-    envsPackageDependencies,
+    compilerPackageDependencies,
+    testerPackageDependencies,
     files,
     mainFile,
     deprecated
   } = component;
   const parsedDevPackageDependencies = parsePackages(devPackageDependencies) || [];
-  const parsedEnvsPackageDependencies = parsePackages(envsPackageDependencies) || [];
-  const printableDevPackageDependencies = parsedDevPackageDependencies.concat(parsedEnvsPackageDependencies);
+  const parsedCompilerPackageDependencies = parsePackages(compilerPackageDependencies) || [];
+  const parsedTesterPackageDependencies = parsePackages(testerPackageDependencies) || [];
+  const printableDevPackageDependencies = [
+    ...parsedDevPackageDependencies,
+    ...parsedCompilerPackageDependencies,
+    ...parsedTesterPackageDependencies
+  ];
+  const printableCompilerDependencies = compilerDependencies.toStringOfIds();
+  const printableTesterDependencies = testerDependencies.toStringOfIds();
+  const peerPackageDependencies = [].concat(parsePackages(component.peerPackageDependencies)).filter(x => x);
+  const overrides = component.overrides.componentOverridesData;
 
   obj.id = component.id.toStringWithoutScope();
   obj.compiler = compiler ? compiler.name : null;
+  obj.compilerFiles = parseEnvFiles(compiler);
   obj.language = lang || null;
   obj.tester = tester ? tester.name : null;
+  obj.testerFiles = parseEnvFiles(tester);
   obj.mainFile = mainFile ? normalize(mainFile) : null;
   obj.dependencies = dependencies
     .toStringOfIds()
+    .sort()
     .concat(parsePackages(packageDependencies))
     .filter(x => x);
   obj.devDependencies = devDependencies
     .toStringOfIds()
+    .sort()
     .concat(printableDevPackageDependencies)
+    .concat(printableCompilerDependencies)
+    .concat(printableTesterDependencies)
     .filter(x => x);
-  obj.peerDependencies = parsePackages(peerPackageDependencies);
+  obj.peerDependencies = peerPackageDependencies.length ? peerPackageDependencies : undefined;
 
   obj.files =
     files && !R.isEmpty(files) && !R.isNil(files)
@@ -58,6 +82,9 @@ export function componentToPrintableForDiff(component: Component): Object {
       ? files.filter(file => file.test).map(file => normalize(file.relative))
       : null;
   obj.deprecated = deprecated ? 'True' : null;
+  obj.overridesDependencies = parsePackages(overrides.dependencies);
+  obj.overridesDevDependencies = parsePackages(overrides.devDependencies);
+  obj.overridesPeerDependencies = parsePackages(overrides.peerDependencies);
   return obj;
 }
 
@@ -85,13 +112,9 @@ export function getDiffBetweenObjects(objectLeft: Object, objectRight: Object): 
 export function diffBetweenComponentsObjects(
   consumer: Consumer,
   componentLeft: Component,
-  componentRight: Component
+  componentRight: Component,
+  verbose: boolean
 ): ?(FieldsDiff[]) {
-  const componentMap = consumer.bitMap.getComponent(componentLeft.id, false, true, true);
-  if (componentMap && componentMap.origin === COMPONENT_ORIGINS.IMPORTED) {
-    componentLeft.stripOriginallySharedDir(consumer.bitMap);
-    componentRight.stripOriginallySharedDir(consumer.bitMap);
-  }
   const printableLeft = componentToPrintableForDiff(componentLeft);
   const printableRight = componentToPrintableForDiff(componentRight);
   const fieldsDiff = getDiffBetweenObjects(printableLeft, printableRight);
@@ -126,12 +149,13 @@ export function diffBetweenComponentsObjects(
   });
 
   const dependenciesOutput = () => {
+    if (!verbose) return [];
     const dependenciesLeft = componentLeft.getAllDependencies();
     const dependenciesRight = componentRight.getAllDependencies();
     if (R.isEmpty(dependenciesLeft) || R.isEmpty(dependenciesRight)) return [];
     return dependenciesLeft.reduce((acc, dependencyLeft) => {
       const idStr = dependencyLeft.id.toString();
-      const dependencyRight = dependenciesRight.find(dep => dep.id.toString() === idStr);
+      const dependencyRight = dependenciesRight.find(dep => dep.id.isEqual(dependencyLeft.id));
       if (!dependencyRight) return acc;
       if (JSON.stringify(dependencyLeft.relativePaths) === JSON.stringify(dependencyRight.relativePaths)) return acc;
       const fieldName = `Dependency ${idStr} relative-paths`;

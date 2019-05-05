@@ -2,12 +2,14 @@
 // all errors that the command does not handle comes to this switch statement
 // if you handle the error, then return true
 import chalk from 'chalk';
-import { InvalidBitId, InvalidIdChunk } from '../bit-id/exceptions';
+import hashErrorIfNeeded from '../error/hash-error-object';
+import { InvalidBitId, InvalidIdChunk, InvalidName, InvalidScopeName } from '../bit-id/exceptions';
 import {
   ConsumerAlreadyExists,
   NothingToImport,
   ConsumerNotFound,
   ComponentSpecsFailed,
+  ComponentOutOfSync,
   MissingDependencies,
   NewerVersionFound,
   LoginFailed
@@ -35,13 +37,18 @@ import {
   CorruptedComponent,
   VersionAlreadyExists,
   MergeConflict,
+  InvalidIndexJson,
   HashMismatch,
   MergeConflictOnRemote,
+  OutdatedIndexJson,
   VersionNotFound,
-  CyclicDependencies
+  CyclicDependencies,
+  HashNotFound
 } from '../scope/exceptions';
-import InvalidBitJson from '../consumer/bit-json/exceptions/invalid-bit-json';
+import InvalidBitJson from '../consumer/config/exceptions/invalid-bit-json';
+import InvalidPackageJson from '../consumer/config/exceptions/invalid-package-json';
 import InvalidVersion from '../api/consumer/lib/exceptions/invalid-version';
+import NoIdMatchWildcard from '../api/consumer/lib/exceptions/no-id-match-wildcard';
 import NothingToCompareTo from '../api/consumer/lib/exceptions/nothing-to-compare-to';
 import PromptCanceled from '../prompts/exceptions/prompt-canceled';
 import IdExportedAlready from '../api/consumer/lib/exceptions/id-exported-already';
@@ -62,11 +69,13 @@ import {
   VersionShouldBeRemoved,
   TestIsDirectory,
   MainFileIsDir,
+  PathOutsideConsumer,
+  MissingMainFileMultipleComponents,
   ExcludedMainFile
 } from '../consumer/component-ops/add-components/exceptions';
 import { Analytics, LEVEL } from '../analytics/analytics';
-import ExternalTestError from '../consumer/component/exceptions/external-test-error';
-import ExternalBuildError from '../consumer/component/exceptions/external-build-error';
+import ExternalTestErrors from '../consumer/component/exceptions/external-test-errors';
+import ExternalBuildErrors from '../consumer/component/exceptions/external-build-errors';
 import InvalidCompilerInterface from '../consumer/component/exceptions/invalid-compiler-interface';
 import ExtensionFileNotFound from '../extensions/exceptions/extension-file-not-found';
 import ExtensionNameNotValid from '../extensions/exceptions/extension-name-not-valid';
@@ -76,8 +85,26 @@ import AbstractError from '../error/abstract-error';
 import { PathToNpmrcNotExist, WriteToNpmrcError } from '../consumer/login/exceptions';
 import ExtensionLoadError from '../extensions/exceptions/extension-load-error';
 import ExtensionGetDynamicPackagesError from '../extensions/exceptions/extension-get-dynamic-packages-error';
+import ExtensionGetDynamicConfigError from '../extensions/exceptions/extension-get-dynamic-config-error';
 import ExtensionInitError from '../extensions/exceptions/extension-init-error';
 import MainFileRemoved from '../consumer/component/exceptions/main-file-removed';
+import InvalidConfigDir from '../consumer/bit-map/exceptions/invalid-config-dir';
+import EjectToWorkspace from '../consumer/component/exceptions/eject-to-workspace';
+import EjectBoundToWorkspace from '../consumer/component/exceptions/eject-bound-to-workspace';
+import EjectNoDir from '../consumer/component-ops/exceptions/eject-no-dir';
+import { COMPONENT_DIR, DEBUG_LOG, BASE_DOCS_DOMAIN } from '../constants';
+import InjectNonEjected from '../consumer/component/exceptions/inject-non-ejected';
+import ExtensionSchemaError from '../extensions/exceptions/extension-schema-error';
+import GitNotFound from '../utils/git/exceptions/git-not-found';
+import ObjectsWithoutConsumer from '../api/consumer/lib/exceptions/objects-without-consumer';
+import InvalidConfigPropPath from '../consumer/config/exceptions/invalid-config-prop-path';
+import DiagnosisNotFound from '../api/consumer/lib/exceptions/diagnosis-not-found';
+import MissingDiagnosisName from '../api/consumer/lib/exceptions/missing-diagnosis-name';
+import RemoteResolverError from '../scope/network/exceptions/remote-resolver-error';
+import ExportAnotherOwnerPrivate from '../scope/network/exceptions/export-another-owner-private';
+
+const reportIssueToGithubMsg =
+  'This error should have never happened. Please report this issue on Github https://github.com/teambit/bit/issues';
 
 const errorsMap: Array<[Class<Error>, (err: Class<Error>) => string]> = [
   [
@@ -121,7 +148,21 @@ const errorsMap: Array<[Class<Error>, (err: Class<Error>) => string]> = [
     () => 'error: remote scope protocol is not supported, please use: `ssh://`, `file://` or `bit://`'
   ],
   [RemoteScopeNotFound, err => `error: remote scope "${chalk.bold(err.name)}" was not found.`],
-  [InvalidBitId, () => 'error: component ID is invalid, please use the following format: [scope]/[namespace]/<name>'],
+  [InvalidBitId, () => 'error: component ID is invalid, please use the following format: [scope]/<name>'],
+  [InvalidConfigDir, err => `error: the eject path is already part of "${chalk.bold(err.compId)}" path`],
+  [EjectToWorkspace, () => 'error: could not eject config to the workspace root please provide a valid path'],
+  [
+    EjectBoundToWorkspace,
+    () => 'error: could not eject config for authored component which are bound to the workspace configuration'
+  ],
+  [InjectNonEjected, () => 'error: could not inject config for already injected component'],
+  [
+    EjectNoDir,
+    err =>
+      `error: could not eject config for ${chalk.bold(
+        err.compId
+      )}, please provide path which doesn't contain {${COMPONENT_DIR}} to eject`
+  ],
   [
     ComponentNotFound,
     (err) => {
@@ -138,27 +179,24 @@ const errorsMap: Array<[Class<Error>, (err: Class<Error>) => string]> = [
     err =>
       `error: the model representation of "${chalk.bold(err.id)}" is corrupted, the object of version ${
         err.version
-      } is missing. please report this issue on Github https://github.com/teambit/bit/issues`
+      } is missing.\n${reportIssueToGithubMsg}`
   ],
   [
     DependencyNotFound,
     err =>
       `error: dependency "${chalk.bold(
         err.id
-      )}" was not found. please track this component or use --ignore-missing-dependencies flag (not recommended)`
+      )}" was not found. please track this component or use --ignore-unresolved-dependencies flag (not recommended)`
   ],
   [EmptyDirectory, () => chalk.yellow('directory is empty, no files to add')],
-  [
-    ValidationError,
-    err => `${err.message}\nThis error should have never happened. Please open a new Github issue with the bug details`
-  ],
+  [ValidationError, err => `${err.message}\n${reportIssueToGithubMsg}`],
   [ComponentNotFoundInPath, err => `error: component in path "${chalk.bold(err.path)}" was not found`],
   [
     PermissionDenied,
     err =>
       `error: permission to scope ${
         err.scope
-      } was denied\nsee troubleshooting at https://docs.bitsrc.io/docs/authentication-issues.html`
+      } was denied\nsee troubleshooting at https://${BASE_DOCS_DOMAIN}/docs/authentication-issues.html`
   ],
   [RemoteNotFound, err => `error: remote "${chalk.bold(err.name)}" was not found`],
   [NetworkError, err => `error: remote failed with error the following error:\n "${chalk.bold(err.remoteErr)}"`],
@@ -169,6 +207,7 @@ const errorsMap: Array<[Class<Error>, (err: Class<Error>) => string]> = [
   currentHash: ${chalk.bold(err.currentHash)}
   this usually happens when a component is old and the migration script was not running or interrupted`
   ],
+  [HashNotFound, err => `hash ${chalk.bold(err.hash)} not found`],
   [
     MergeConflict,
     err =>
@@ -193,13 +232,44 @@ to resolve this conflict and merge your remote and local changes, please do the 
 3) bit checkout [version] [id]
 once your changes are merged with the new remote version, please tag and export a new version of the component to the remote scope.`
   ],
+  [
+    OutdatedIndexJson,
+    err => `error: component ${chalk.bold(
+      err.componentId
+    )} found in the index.json file, however, is missing from the scope.
+to get the file rebuild, please delete it at "${err.indexJsonPath}".\n${reportIssueToGithubMsg}
+`
+  ],
   [CyclicDependencies, err => `${err.msg.toString().toLocaleLowerCase()}`],
   [
     UnexpectedNetworkError,
     err => `error: unexpected network error has occurred. ${err.message ? ` original message: ${err.message}` : ''}`
   ],
-  [SSHInvalidResponse, () => 'error: received an invalid response from the remote SSH server'],
-  [ScopeNotFound, () => 'error: workspace not found. to create a new workspace, please use `bit init`'],
+  [
+    RemoteResolverError,
+    err => `error: ${err.message ? `${err.message}` : 'unexpected remote resolver error has occurred'}`
+  ],
+  [
+    ExportAnotherOwnerPrivate,
+    err => `error: unable to export components to ${
+      err.destinationScope
+    } because they have dependencies on components in ${err.sourceScope}.
+bit does not allow setting dependencies between components in private collections managed by different owners.
+
+see troubleshooting at https://${BASE_DOCS_DOMAIN}/docs/bitdev-permissions.html`
+  ],
+  [
+    SSHInvalidResponse,
+    () => `error: received an invalid response from the remote SSH server.
+to see the invalid response, have a look at the log, located at ${DEBUG_LOG}`
+  ],
+  [
+    InvalidIndexJson,
+    err => `fatal: your .bit/index.json is not a valid JSON file.
+To rebuild the file, please run ${chalk.bold('bit init --reset')}.
+Original Error: ${err.message}`
+  ],
+  [ScopeNotFound, err => `error: scope not found at ${chalk.bold(err.scopePath)}`],
   [
     ScopeJsonNotFound,
     err =>
@@ -207,6 +277,8 @@ once your changes are merged with the new remote version, please tag and export 
         'bit init'
       )} to recreate the file`
   ],
+  [MissingDiagnosisName, err => 'error: please provide a diagnosis name'],
+  [DiagnosisNotFound, err => `error: diagnosis ${chalk.bold(err.diagnosisName)} not found`],
   [
     ComponentSpecsFailed,
     err =>
@@ -215,19 +287,20 @@ once your changes are merged with the new remote version, please tag and export 
       }component tests failed. please make sure all tests pass before tagging a new version or use the "--force" flag to force-tag components.\nto view test failures, please use the "--verbose" flag or use the "bit test" command`
   ],
   [
+    ComponentOutOfSync,
+    err => `component ${chalk.bold(err.id)} is not in-sync between the consumer and the scope.
+if it is originated from another git branch, go back to that branch to continue working on the component.
+if possible, remove the component using "bit remove" and re-import or re-create it.
+to re-start Bit from scratch, deleting all objects from the scope, use "bit init --reset-hard"`
+  ],
+  [
     MissingDependencies,
     (err) => {
       const missingDepsColored = componentIssuesTemplate(err.components);
       return `error: issues found with the following component dependencies\n${missingDepsColored}`;
     }
   ],
-  [
-    NothingToImport,
-    () =>
-      chalk.yellow(
-        'nothing to import. please use `bit import [component_id]` or configure your dependencies in bit.json'
-      )
-  ],
+  [NothingToImport, () => chalk.yellow('nothing to import. please use `bit import [component_id]`')],
   [
     InvalidIdChunk,
     err =>
@@ -236,9 +309,35 @@ once your changes are merged with the new remote version, please tag and export 
       )}" is invalid, component IDs can only contain alphanumeric, lowercase characters, and the following ["-", "_", "$", "!"]`
   ],
   [
+    InvalidName,
+    err =>
+      `error: "${chalk.bold(
+        err.componentName
+      )}" is invalid, component names can only contain alphanumeric, lowercase characters, and the following ["-", "_", "$", "!", "/"]`
+  ],
+  [
+    InvalidScopeName,
+    err =>
+      `error: "${chalk.bold(
+        err.scopeName
+      )}" is invalid, component scope names can only contain alphanumeric, lowercase characters, and the following ["-", "_", "$", "!"]`
+  ],
+  [
     InvalidBitJson,
     err => `error: invalid bit.json: ${chalk.bold(err.path)} is not a valid JSON file.
-    consider running ${chalk.bold('bit init --reset')} to recreate the file`
+consider running ${chalk.bold('bit init --reset')} to recreate the file`
+  ],
+  [
+    InvalidPackageJson,
+    err => `error: package.json at ${chalk.bold(err.path)} is not a valid JSON file.
+please fix the file in order to run bit commands`
+  ],
+  [
+    InvalidConfigPropPath,
+    err => `error: the path "${chalk.bold(err.fieldValue)}" of "${chalk.bold(
+      err.fieldName
+    )}" in your bit.json or package.json file is invalid.
+please make sure it's not absolute and doesn't contain invalid characters`
   ],
   [
     DriverNotFound,
@@ -250,7 +349,16 @@ once your changes are merged with the new remote version, please tag and export 
   [
     MissingMainFile,
     err =>
-      'error: one or more of the added components does not contain a main file.\nplease either use --id to group all added files as one component or use our DSL to define the main file dynamically.\nsee troubleshooting at https://docs.bitsrc.io/docs/isolating-and-tracking-components.html#define-a-components-main-file'
+      `error: the component ${chalk.bold(
+        err.componentId
+      )} does not contain a main file.\nplease either use --id to group all added files as one component or use our DSL to define the main file dynamically.\nsee troubleshooting at https://${BASE_DOCS_DOMAIN}/docs/isolating-and-tracking-components.html#define-a-components-main-file`
+  ],
+  [
+    MissingMainFileMultipleComponents,
+    err =>
+      `error: the components ${chalk.bold(
+        err.componentIds.join(', ')
+      )} does not contain a main file.\nplease either use --id to group all added files as one component or use our DSL to define the main file dynamically.\nsee troubleshooting at https://${BASE_DOCS_DOMAIN}/docs/isolating-and-tracking-components.html#define-a-components-main-file`
   ],
   [
     InvalidBitMap,
@@ -298,6 +406,10 @@ please use "bit remove" to delete the component or "bit add" with "--main" and "
       )}" was not found on your local workspace.\nplease specify a valid component ID or track the component using 'bit add' (see 'bit add --help' for more information)`
   ],
   [PathsNotExist, err => `error: file or directory "${chalk.bold(err.paths.join(', '))}" was not found.`],
+  [
+    PathOutsideConsumer,
+    err => `error: file or directory "${chalk.bold(err.path)}" is located outside of the workspace.`
+  ],
   [WriteToNpmrcError, err => `unable to add @bit as a scoped registry at "${chalk.bold(err.path)}"`],
   [PathToNpmrcNotExist, err => `error: file or directory "${chalk.bold(err.path)}" was not found.`],
 
@@ -339,6 +451,10 @@ please use "bit remove" to delete the component or "bit add" with "--main" and "
     InvalidVersion,
     err => `error: version ${chalk.bold(err.version)} is not a valid semantic version. learn more: https://semver.org`
   ],
+  [
+    NoIdMatchWildcard,
+    err => `unable to find component ids that match the following: ${err.idsWithWildcards.join(', ')}`
+  ],
   [NothingToCompareTo, err => 'no previous versions to compare'],
   [
     NewerVersionFound,
@@ -347,37 +463,48 @@ please use "bit remove" to delete the component or "bit add" with "--main" and "
   ],
   [PromptCanceled, err => chalk.yellow('operation aborted')],
   [
-    ExternalTestError,
+    ExternalTestErrors,
     err =>
-      `error: bit failed to test ${err.id} with the following exception:\n${err.originalError.message}.\n${
-        err.originalError.stack
-      }`
+      `error: bit failed to test ${err.id} with the following exception:\n${getExternalErrorsMessageAndStack(
+        err.originalErrors
+      )}`
   ],
   [
-    ExternalBuildError,
+    ExternalBuildErrors,
     err =>
-      `error: bit failed to build ${err.id} with the following exception:\n${err.originalError.message}.\n${
-        err.originalError.stack
-      }`
+      `error: bit failed to build ${err.id} with the following exception:\n${getExternalErrorsMessageAndStack(
+        err.originalErrors
+      )}`
   ],
   [
     ExtensionLoadError,
     err =>
-      `error: bit failed to load ${err.name} with the following exception:\n${err.originalError.message}.\n${
-        err.originalError.stack
-      }`
+      `error: bit failed to load ${err.compName} with the following exception:\n${getExternalErrorMessage(
+        err.originalError
+      )}.\n${err.printStack ? err.originalError.stack : ''}`
+  ],
+  [
+    ExtensionSchemaError,
+    err => `error: configuration passed to extension ${chalk.bold(err.extensionName)} is invalid:\n${err.errors}`
   ],
   [
     ExtensionInitError,
     err =>
-      `error: bit failed to initialized ${err.name} with the following exception:\n${err.originalError.message}.\n${
-        err.originalError.stack
-      }`
+      `error: bit failed to initialized ${err.compName} with the following exception:\n${getExternalErrorMessage(
+        err.originalError
+      )}.\n${err.originalError.stack}`
   ],
   [
     ExtensionGetDynamicPackagesError,
     err =>
-      `error: bit failed to get the dynamic packages from ${err.name} with the following exception:\n${
+      `error: bit failed to get the dynamic packages from ${err.compName} with the following exception:\n${
+        err.originalError.message
+      }.\n${err.originalError.stack}`
+  ],
+  [
+    ExtensionGetDynamicConfigError,
+    err =>
+      `error: bit failed to get the config from ${err.compName} with the following exception:\n${
         err.originalError.message
       }.\n${err.originalError.stack}`
   ],
@@ -388,36 +515,102 @@ please use "bit remove" to delete the component or "bit add" with "--main" and "
   [
     ResolutionException,
     err =>
-      `error: bit failed to require ${err.filePath} due to the following exception:\n${err.originalError.message}.\n${
-        err.originalError.stack
-      }`
+      `error: bit failed to require ${err.filePath} due to the following exception:\n${getExternalErrorMessage(
+        err.originalError
+      )}.\n${err.originalError.stack}`
+  ],
+  [
+    GitNotFound,
+    err =>
+      "error: unable to run command because git executable not found. please ensure git is installed and/or git_path is configured using the 'bit config set git_path <GIT_PATH>'"
   ],
   [
     AuthenticationFailed,
-    err => 'authentication failed. see troubleshooting at https://docs.bitsrc.io/docs/authentication-issues.html'
+    err =>
+      `authentication failed. see troubleshooting at https://${BASE_DOCS_DOMAIN}/docs/authentication-issues.html\n\n${
+        err.debugInfo
+      }`
+  ],
+  [
+    ObjectsWithoutConsumer,
+    err => `error: unable to initialize a bit workspace. bit has found undeleted local objects at ${chalk.bold(
+      err.scopePath
+    )}.
+1. use the ${chalk.bold('--reset-hard')} flag to clear all data and initialize an empty workspace.
+2. if deleted by mistake, please restore .bitmap and bit.json.
+3. force workspace initialization without clearing data use the ${chalk.bold('--force')} flag.`
   ]
 ];
 
-function formatUnhandled(err: Error): string {
-  Analytics.setError(LEVEL.FATAL, err);
-  return chalk.red(err.message || err);
-}
-
-export default (err: Error): ?string => {
+function findErrorDefinition(err: Error) {
   const error = errorsMap.find(([ErrorType]) => {
     return err instanceof ErrorType || err.name === ErrorType.name; // in some cases, such as forked process, the received err is serialized.
   });
+  return error;
+}
 
-  if (!error) return formatUnhandled(err);
-  /* this is an error that bit knows how to handle dont send to sentry */
+function getErrorFunc(errorDefinition) {
+  if (!errorDefinition) return null;
+  const [, func] = errorDefinition;
+  return func;
+}
 
-  if (err instanceof AbstractError) {
-    Analytics.setError(LEVEL.INFO, err.makeAnonymous());
-  } else {
-    Analytics.setError(LEVEL.FATAL, err);
+function getErrorMessage(error: ?Error, func: ?Function): string {
+  if (!error || !func) return '';
+  const errorMessage = func(error);
+  return errorMessage;
+}
+
+function getExternalErrorMessage(externalError: ?Error): string {
+  if (!externalError) return '';
+
+  // In case an error is not a real error
+  if (!(externalError instanceof Error)) {
+    return externalError;
   }
-  const [, func] = error;
-  const errorMessage = func(err);
+  // In case it's not a bit error
+  if (externalError.message) {
+    return externalError.message;
+  }
+  const errorDefinition = findErrorDefinition(externalError);
+  const func = getErrorFunc(errorDefinition);
+  const errorMessage = getErrorMessage(externalError, func);
+  return errorMessage;
+}
+
+function getExternalErrorsMessageAndStack(errors: Error[]): string {
+  const result = errors
+    .map((e) => {
+      const msg = getExternalErrorMessage(e);
+      const stack = e.stack || '';
+      return `${msg}\n${stack}\n`;
+    })
+    .join('~~~~~~~~~~~~~\n');
+  return result;
+}
+
+/**
+ * if err.userError is set, it inherits from AbstractError, which are user errors not Bit errors
+ * and should not be reported to Sentry.
+ * reason why we don't check (err instanceof AbstractError) is that it could be thrown from a fork,
+ * in which case, it loses its class and has only the fields.
+ */
+function sendToAnalyticsAndSentry(err) {
+  const possiblyHashedError = hashErrorIfNeeded(err);
+  // only level FATAL are reported to Sentry.
+  // $FlowFixMe
+  const level = err.isUserError ? LEVEL.INFO : LEVEL.FATAL;
+  Analytics.setError(level, possiblyHashedError);
+}
+
+export default (err: Error): ?string => {
+  const errorDefinition = findErrorDefinition(err);
+  sendToAnalyticsAndSentry(err);
+  if (!errorDefinition) {
+    return chalk.red(err.message || err);
+  }
+  const func = getErrorFunc(errorDefinition);
+  const errorMessage = getErrorMessage(err, func) || 'unknown error';
   err.message = errorMessage;
   logger.error(`User gets the following error: ${errorMessage}`);
   return chalk.red(errorMessage);

@@ -1,71 +1,67 @@
 /** @flow */
+import path from 'path';
 import semver from 'semver';
 import R from 'ramda';
-import { Version, Component as ModelComponent } from '../../scope/models';
-import { Scope } from '../../scope';
+import type Version from '../../scope/models/version';
+import ModelComponent from '../../scope/models/model-component';
+import Scope from '../../scope/scope';
 import Component from '../component';
-import { BitId } from '../../bit-id';
-import logger from '../../logger/logger';
-import BitMap from '../bit-map/bit-map';
-import Consumer from '../consumer';
+import { BitId, BitIds } from '../../bit-id';
+import type BitMap from '../bit-map/bit-map';
+import type Consumer from '../consumer';
 import { filterAsync } from '../../utils';
 import { COMPONENT_ORIGINS } from '../../constants';
+import NoIdMatchWildcard from '../../api/consumer/lib/exceptions/no-id-match-wildcard';
+import { fetchRemoteVersions } from '../../scope/scope-remotes';
+import isBitIdMatchByWildcards from '../../utils/bit/is-bit-id-match-by-wildcards';
 
 export type ObjectsList = Promise<{ [componentId: string]: Version }>;
+
+export type ListScopeResult = {
+  id: BitId,
+  currentlyUsedVersion?: ?string,
+  remoteVersion?: string,
+  deprecated?: boolean
+};
 
 export default class ComponentsList {
   consumer: Consumer;
   scope: Scope;
   bitMap: BitMap;
-  _fromFileSystem: Promise<string[]> = [];
-  _fromBitMap: Object = {};
-  _fromObjects: ObjectsList;
+  _fromFileSystem: { [cacheKey: string]: Component[] } = {};
+  _fromBitMap: { [cacheKey: string]: BitId[] } = {};
+  _fromObjectsIds: BitId[];
+  _modelComponents: ModelComponent[];
   _invalidComponents: string[];
+  _modifiedComponents: Component[];
   constructor(consumer: Consumer) {
     this.consumer = consumer;
     this.scope = consumer.scope;
     this.bitMap = consumer.bitMap;
   }
 
+  async getModelComponents(): Promise<ModelComponent[]> {
+    if (!this._modelComponents) {
+      this._modelComponents = await this.scope.list();
+    }
+    return this._modelComponents;
+  }
+
   /**
-   * List all objects where the id is the object-id and the value is the Version object
-   * It is useful when checking for modified components where the most important data is the Ref.
+   * List all bit ids stored in the model
    */
-  async getFromObjects(): ObjectsList {
-    if (!this._fromObjects) {
-      const componentsObjects = await this.scope.objects.listComponents(false);
-      const componentsVersionsP = {};
-      const componentsVersions = {};
-      componentsObjects.forEach((componentObjects) => {
-        const latestVersionRef = componentObjects.versions[componentObjects.latest()];
-        const ObjId = new BitId({
+  async getFromObjects(): Promise<BitId[]> {
+    if (!this._fromObjectsIds) {
+      const modelComponents: ModelComponent[] = await this.getModelComponents();
+      this._fromObjectsIds = modelComponents.map((componentObjects) => {
+        return new BitId({
           scope: componentObjects.scope,
-          box: componentObjects.box,
           name: componentObjects.name,
           version: componentObjects.scope ? componentObjects.latest() : null
         });
-        componentsVersionsP[ObjId.toString()] = this.scope.getObject(latestVersionRef.hash);
       });
-
-      const allVersions = await Promise.all(R.values(componentsVersionsP));
-
-      Object.keys(componentsVersionsP).forEach((key, i) => {
-        if (!allVersions[i]) {
-          // the component has a REF of its latest version, however, the object of the latest version is missing
-          const bitId = BitId.parse(key);
-          logger.warn(
-            `the model representation of ${bitId.toStringWithoutVersion()} is missing ${
-              bitId.version
-            } version, if this component is nested, this is a normal behavior, otherwise, the component is corrupted`
-          );
-          // throw new CorruptedComponent(bitId.toStringWithoutVersion(), bitId.version);
-        }
-        componentsVersions[key] = allVersions[i];
-      });
-      // $FlowFixMe
-      this._fromObjects = componentsVersions;
     }
-    return this._fromObjects;
+    return this._fromObjectsIds;
   }
 
   async _getAuthoredAndImportedFromFS(): Promise<Component[]> {
@@ -79,26 +75,28 @@ export default class ComponentsList {
   }
 
   /**
-   * Components that are in the model (either, committed from a local scope or imported), and were
+   * Components that are in the model (either, tagged from a local scope or imported), and were
    * changed in the file system
    *
    * @param {boolean} [load=false] - Whether to load the component (false will return only the id)
    * @return {Promise<string[]>}
    */
   async listModifiedComponents(load: boolean = false): Promise<Array<BitId | Component>> {
-    const fileSystemComponents = await this._getAuthoredAndImportedFromFS();
-    const modifiedComponents = await filterAsync(fileSystemComponents, (component) => {
-      return this.consumer.getComponentStatusById(component.id).then(status => status.modified);
-    });
-    if (load) return modifiedComponents;
-    return modifiedComponents.map(component => component.id);
+    if (!this._modifiedComponents) {
+      const fileSystemComponents = await this._getAuthoredAndImportedFromFS();
+      this._modifiedComponents = await filterAsync(fileSystemComponents, (component) => {
+        return this.consumer.getComponentStatusById(component.id).then(status => status.modified);
+      });
+    }
+    if (load) return this._modifiedComponents;
+    return this._modifiedComponents.map(component => component.id);
   }
 
   async listOutdatedComponents(): Promise<Component[]> {
     const fileSystemComponents = await this._getAuthoredAndImportedFromFS();
-    const componentsFromModel = await this.scope.objects.listComponents(false);
+    const componentsFromModel = await this.getModelComponents();
     return fileSystemComponents.filter((component) => {
-      const modelComponent = componentsFromModel.find(c => c.id() === component.id.toStringWithoutVersion());
+      const modelComponent = componentsFromModel.find(c => c.toBitId().isEqualWithoutVersion(component.id));
       if (!modelComponent) return false;
       const latestVersion = modelComponent.latest();
       if (component.id.hasVersion() && semver.gt(latestVersion, component.id.version)) {
@@ -109,13 +107,16 @@ export default class ComponentsList {
     });
   }
 
-  async newAndModifiedComponents(): Promise<Component[]> {
+  async newModifiedAndAutoTaggedComponents(): Promise<Component[]> {
     const [newComponents, modifiedComponents] = await Promise.all([
       this.listNewComponents(true),
       this.listModifiedComponents(true)
     ]);
 
-    const components = [...newComponents, ...modifiedComponents];
+    const autoTagPendingModel: ModelComponent[] = await this.listAutoTagPendingComponents();
+    const autoTagPending: Component[] = await this.scope.toConsumerComponents(autoTagPendingModel);
+
+    const components: Component[] = [...newComponents, ...modifiedComponents, ...autoTagPending];
 
     return Promise.all(components);
   }
@@ -124,33 +125,31 @@ export default class ComponentsList {
     return this._getAuthoredAndImportedFromFS();
   }
 
-  async idsFromObjects(withScope: boolean = true): Promise<string[]> {
+  async idsFromObjects(): Promise<BitIds> {
     const fromObjects = await this.getFromObjects();
-    const ids = Object.keys(fromObjects);
-    if (withScope) return ids;
-    return ids.map(id => BitId.parse(id).toStringWithoutScopeAndVersion());
+    return new BitIds(...fromObjects);
   }
 
   /**
-   * Components that are registered in bit.map but have never been committed
+   * Components that are registered in bit.map but have never been tagged
    *
    * @param {boolean} [load=false] - Whether to load the component (false will return only the id)
    * @return {Promise.<string[] | Component[]>}
    * @memberof ComponentsList
    */
-  async listNewComponents(load: boolean = false): Promise<Array<string | Component>> {
-    const idsFromBitMap = await this.idsFromBitMap(false);
-    const idsFromObjects = await this.idsFromObjects(false);
-    const newComponents = [];
-    idsFromBitMap.forEach((id) => {
-      if (!idsFromObjects.includes(id)) {
+  async listNewComponents(load: boolean = false): Promise<BitIds | Component[]> {
+    const idsFromBitMap = this.idsFromBitMap();
+    const idsFromObjects = await this.idsFromObjects();
+    const newComponents: BitId[] = [];
+    idsFromBitMap.forEach((id: BitId) => {
+      if (!idsFromObjects.searchWithoutScopeAndVersion(id)) {
         newComponents.push(id);
       }
     });
-    if (!load || !newComponents.length) return newComponents;
+    const newComponentsIds = new BitIds(...newComponents);
+    if (!load || !newComponents.length) return newComponentsIds;
 
-    const componentsIds = newComponents.map(id => BitId.parse(id));
-    const { components } = await this.consumer.loadComponents(componentsIds, false);
+    const { components } = await this.consumer.loadComponents(newComponentsIds, false);
     return components;
   }
 
@@ -172,52 +171,50 @@ export default class ComponentsList {
     return { newComponents, importPendingComponents };
   }
 
-  async listCommitPendingOfAllScope(version: string, includeImported: boolean = false) {
-    let commitPendingComponents;
-    commitPendingComponents = await this.idsFromBitMap(true, COMPONENT_ORIGINS.AUTHORED);
+  async listCommitPendingOfAllScope(
+    version: string,
+    includeImported: boolean = false
+  ): Promise<{ tagPendingComponents: BitId[], warnings: string[] }> {
+    let tagPendingComponents;
+    tagPendingComponents = this.idsFromBitMap(COMPONENT_ORIGINS.AUTHORED);
     if (includeImported) {
-      const importedComponents = await this.idsFromBitMap(true, COMPONENT_ORIGINS.IMPORTED);
-      commitPendingComponents = commitPendingComponents.concat(importedComponents);
+      const importedComponents = this.idsFromBitMap(COMPONENT_ORIGINS.IMPORTED);
+      tagPendingComponents = tagPendingComponents.concat(importedComponents);
     }
-    const commitPendingComponentsIds = commitPendingComponents.map(componentId => BitId.parse(componentId));
-    const commitPendingComponentsLatest = await this.scope.latestVersions(commitPendingComponentsIds, false);
+    const tagPendingComponentsLatest = await this.scope.latestVersions(tagPendingComponents, false);
     const warnings = [];
-    commitPendingComponentsLatest.forEach((componentId) => {
+    tagPendingComponentsLatest.forEach((componentId) => {
       if (semver.gt(componentId.version, version)) {
         warnings.push(`warning: ${componentId.toString()} has a version greater than ${version}`);
       }
     });
-    return { commitPendingComponents, warnings };
+    return { tagPendingComponents, warnings };
   }
 
   /**
-   * New and modified components are commit pending
+   * New and modified components are tag pending
    *
    * @return {Promise<string[]>}
    */
-  async listCommitPendingComponents(): Promise<string[]> {
+  async listCommitPendingComponents(): Promise<BitIds> {
     const [newComponents, modifiedComponents] = await Promise.all([
       this.listNewComponents(),
       this.listModifiedComponents()
     ]);
-    const modifiedComponentsWithoutScopeAndVersion = modifiedComponents.map(componentId =>
-      componentId.toStringWithoutScopeAndVersion()
-    );
-    return [...newComponents, ...modifiedComponentsWithoutScopeAndVersion];
+
+    return BitIds.fromArray([...newComponents, ...modifiedComponents]);
   }
 
-  /**
-   * Components from the model where the scope is local are pending for export
-   * Also, components that their model version is higher than their bit.map version.
-   * @return {Promise<string[]>}
-   */
-  async listExportPendingComponents(load: boolean = false): Promise<string[] | ModelComponent[]> {
-    const idsFromObjects = await this.idsFromObjects();
-    const ids = await filterAsync(idsFromObjects, (componentId) => {
-      return this.consumer.getComponentStatusById(BitId.parse(componentId)).then(status => status.staged);
-    });
-    if (!load) return ids;
-    return Promise.all(ids.map(id => this.scope.sources.get(BitId.parse(id))));
+  async listExportPendingComponentsIds(): Promise<BitIds> {
+    const modelComponents = await this.getModelComponents();
+    const pendingExportComponents = modelComponents.filter(component => component.isLocallyChanged());
+    return BitIds.fromArray(pendingExportComponents.map(c => c.toBitId()));
+  }
+
+  async listExportPendingComponents(): Promise<ModelComponent[]> {
+    const exportPendingComponentsIds: BitIds = await this.listExportPendingComponentsIds();
+    // $FlowFixMe
+    return Promise.all(exportPendingComponentsIds.map(id => this.scope.getModelComponentIfExist(id)));
   }
 
   async listAutoTagPendingComponents(): Promise<ModelComponent[]> {
@@ -227,11 +224,9 @@ export default class ComponentsList {
     return this.consumer.listComponentsForAutoTagging(modifiedComponentsLatestVersions);
   }
 
-  async idsFromBitMap(withScopeName: boolean = true, origin?: string): Promise<string[]> {
+  idsFromBitMap(origin?: string): BitId[] {
     const fromBitMap = this.getFromBitMap(origin);
-    const ids = Object.keys(fromBitMap);
-    if (withScopeName) return ids;
-    return ids.map(id => BitId.parse(id).toStringWithoutScopeAndVersion());
+    return fromBitMap;
   }
 
   /**
@@ -239,14 +234,12 @@ export default class ComponentsList {
    * Components might be stored in the default component directory and also might be outside
    * of that directory. The bit.map is used to find them all
    * If they are on bit.map but not on the file-system, populate them to _invalidComponents property
-   * @return {Promise<Component[]>}
    */
   async getFromFileSystem(origin?: string): Promise<Component[]> {
     const cacheKeyName = origin || 'all';
     if (!this._fromFileSystem[cacheKeyName]) {
-      const idsFromBitMap = await this.idsFromBitMap(true, origin);
-      const parsedBitIds = idsFromBitMap.map(id => BitId.parse(id));
-      const { components, invalidComponents } = await this.consumer.loadComponents(parsedBitIds, false);
+      const idsFromBitMap = this.idsFromBitMap(origin);
+      const { components, invalidComponents } = await this.consumer.loadComponents(idsFromBitMap, false);
       this._fromFileSystem[cacheKeyName] = components;
       if (!this._invalidComponents && !origin) {
         this._invalidComponents = invalidComponents;
@@ -265,15 +258,81 @@ export default class ComponentsList {
     return this._invalidComponents;
   }
 
-  getFromBitMap(origin?: string): Object {
+  getFromBitMap(origin?: string): BitId[] {
     const cacheKeyName = origin || 'all';
     if (!this._fromBitMap[cacheKeyName]) {
-      this._fromBitMap[cacheKeyName] = this.bitMap.getAllComponents(origin);
+      const originParam = origin ? [origin] : undefined;
+      this._fromBitMap[cacheKeyName] = this.bitMap.getAllBitIds(originParam);
     }
     return this._fromBitMap[cacheKeyName];
   }
 
-  static sortComponentsByName(components: Component[] | ModelComponent | string[]): Component[] | string[] {
+  getPathsForAllFilesOfAllComponents(origin?: string, absolute: boolean = false): string[] {
+    // TODO: maybe cache this as well
+    const componentsFromBitMap = this.bitMap.getAllComponents(origin);
+    const res = [];
+    const getPaths = (agg, isAbsolute) => (componentMap, componentId) => {
+      const relativePaths = componentMap.getFilesRelativeToConsumer();
+      if (!isAbsolute) {
+        agg.push(...relativePaths);
+        return;
+      }
+      const consumerPath = this.consumer.getPath();
+      const absPaths = relativePaths.map(relativePath => path.join(consumerPath, relativePath));
+      agg.push(...absPaths);
+    };
+    R.forEachObjIndexed(getPaths(res, absolute), componentsFromBitMap);
+    return res;
+  }
+
+  /**
+   * get called when the Consumer is available, shows also components from remote scopes
+   */
+  async listScope(showRemoteVersion: boolean, includeNested: boolean): Promise<ListScopeResult[]> {
+    const components: ModelComponent[] = await this.getModelComponents();
+    const componentsSorted = ComponentsList.sortComponentsByName(components);
+    const listScopeResults: ListScopeResult[] = componentsSorted.map((component: ModelComponent) => ({
+      id: component.toBitIdWithLatestVersion(),
+      deprecated: component.deprecated
+    }));
+    const componentsIds = listScopeResults.map(result => result.id);
+    if (showRemoteVersion) {
+      const latestVersionsInfo: BitId[] = await fetchRemoteVersions(this.scope, componentsIds);
+      latestVersionsInfo.forEach((componentId) => {
+        const listResult = listScopeResults.find(c => c.id.isEqualWithoutVersion(componentId));
+        if (!listResult) throw new Error(`failed finding ${componentId.toString()} in componentsIds`);
+        // $FlowFixMe version must be set as it came from a remote
+        listResult.remoteVersion = componentId.version;
+      });
+    }
+    const authoredAndImportedIds = this.bitMap.getAuthoredAndImportedBitIds();
+    listScopeResults.forEach((listResult) => {
+      const existingBitMapId = authoredAndImportedIds.searchWithoutVersion(listResult.id);
+      if (existingBitMapId) {
+        listResult.currentlyUsedVersion = existingBitMapId.version;
+      }
+    });
+    if (includeNested) return listScopeResults;
+    return listScopeResults.filter((listResult) => {
+      const componentMap = this.bitMap.getComponentIfExist(listResult.id, { ignoreVersion: true });
+      return componentMap && componentMap.origin !== COMPONENT_ORIGINS.NESTED;
+    });
+  }
+
+  /**
+   * get called from a bare-scope, shows only components of that scope
+   */
+  static async listLocalScope(scope: Scope): Promise<ListScopeResult[]> {
+    const components = await scope.listLocal();
+    const componentsSorted = ComponentsList.sortComponentsByName(components);
+    return componentsSorted.map((component: ModelComponent) => ({
+      id: component.toBitIdWithLatestVersion(),
+      deprecated: component.deprecated
+    }));
+  }
+
+  // components can be one of the following: Component[] | ModelComponent[] | string[]
+  static sortComponentsByName<T>(components: T): T {
     const getName = (component) => {
       let name;
       if (R.is(ModelComponent, component)) name = component.id();
@@ -281,6 +340,7 @@ export default class ComponentsList {
       else name = component;
       return name.toUpperCase(); // ignore upper and lowercase
     };
+    // $FlowFixMe
     return components.sort((a, b) => {
       const nameA = getName(a);
       const nameB = getName(b);
@@ -294,5 +354,31 @@ export default class ComponentsList {
       // names must be equal
       return 0;
     });
+  }
+
+  static filterComponentsByWildcard<T>(components: T, idsWithWildcard: string[] | string): T {
+    const getBitId = (component): BitId => {
+      if (R.is(ModelComponent, component)) return component.toBitId();
+      if (R.is(Component, component)) return component.id;
+      if (R.is(BitId, component)) return component;
+      throw new TypeError(`filterComponentsByWildcard got component with the wrong type: ${typeof component}`);
+    };
+    // $FlowFixMe
+    return components.filter((component) => {
+      const bitId: BitId = getBitId(component);
+      return isBitIdMatchByWildcards(bitId, idsWithWildcard);
+    });
+  }
+
+  static getUniqueComponents(components: Component[]): Component[] {
+    return R.uniqBy(component => JSON.stringify(component.id), components);
+  }
+
+  listComponentsByIdsWithWildcard(idsWithWildcard: string[]): BitId[] {
+    const allIds = this.bitMap.getAuthoredAndImportedBitIds();
+    const matchedIds = ComponentsList.filterComponentsByWildcard(allIds, idsWithWildcard);
+    if (!matchedIds.length) throw new NoIdMatchWildcard(idsWithWildcard);
+    // $FlowFixMe filterComponentsByWildcard got BitId so it returns BitId
+    return matchedIds;
   }
 }

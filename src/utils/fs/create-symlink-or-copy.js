@@ -11,14 +11,16 @@ import GeneralError from '../../error/general-error';
  * @param destPath the path where to write the symlink
  * @param componentId
  */
-export default function createSymlinkOrCopy(srcPath: PathOsBased, destPath: PathOsBased, componentId: string = '') {
-  fs.removeSync(destPath); // in case a component has been moved
+export default function createSymlinkOrCopy(srcPath: PathOsBased, destPath: PathOsBased, componentId?: ?string = '') {
+  logger.info(`create-symlink-or-copy, deleting ${destPath}`);
+  fs.removeSync(destPath); // in case a symlink already generated or when linking a component, when a component has been moved
   fs.ensureDirSync(path.dirname(destPath));
   try {
     logger.debug(`generating a symlink on ${destPath} pointing to ${srcPath}`);
     symlinkOrCopy.sync(srcPath, destPath);
   } catch (err) {
-    throw new GeneralError(`failed to link a component ${componentId}.
+    const errorHeader = componentId ? `failed to link a component ${componentId}` : 'failed to generate a symlink';
+    throw new GeneralError(`${errorHeader}.
          Symlink (or maybe copy for Windows) from: ${srcPath}, to: ${destPath} was failed.
          Original error: ${err}`);
   }

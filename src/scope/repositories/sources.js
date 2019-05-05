@@ -3,33 +3,29 @@ import R from 'ramda';
 import { bufferFrom, eol } from '../../utils';
 import { BitObject } from '../objects';
 import ComponentObjects from '../component-objects';
-import Scope from '../scope';
-import {
-  CFG_USER_NAME_KEY,
-  CFG_USER_EMAIL_KEY,
-  DEFAULT_BIT_RELEASE_TYPE,
-  COMPONENT_ORIGINS,
-  LATEST_BIT_VERSION
-} from '../../constants';
-import { MergeConflict, MergeConflictOnRemote, ComponentNotFound } from '../exceptions';
-import { Component, Version, Source, Symlink } from '../models';
-import { BitId } from '../../bit-id';
-import type { ComponentProps } from '../models/component';
-import ConsumerComponent from '../../consumer/component';
+import type Scope from '../scope';
+import { CFG_USER_NAME_KEY, CFG_USER_EMAIL_KEY, DEFAULT_BIT_RELEASE_TYPE, COMPONENT_ORIGINS } from '../../constants';
+import { MergeConflict, ComponentNotFound } from '../exceptions';
+import { ModelComponent, Version, Source, Symlink } from '../models';
+import { BitId, BitIds } from '../../bit-id';
+import type { ComponentProps } from '../models/model-component';
+import type ConsumerComponent from '../../consumer/component';
 import * as globalConfig from '../../api/consumer/lib/global-config';
-import { Consumer } from '../../consumer';
 import logger from '../../logger/logger';
 import Repository from '../objects/repository';
 import AbstractVinyl from '../../consumer/component/sources/abstract-vinyl';
+import type Consumer from '../../consumer/consumer';
+import type { PathOsBased, PathLinux } from '../../utils/path';
+import { revertDirManipulationForPath } from '../../consumer/component-ops/manipulate-dir';
 
 export type ComponentTree = {
-  component: Component,
+  component: ModelComponent,
   objects: BitObject[]
 };
 
 export type ComponentDef = {
   id: BitId,
-  component: ?Component
+  component: ?ModelComponent
 };
 
 export default class SourceRepository {
@@ -43,18 +39,7 @@ export default class SourceRepository {
     return this.scope.objects;
   }
 
-  async findComponent(component: Component): Promise<?Component> {
-    try {
-      const foundComponent = await this.objects().findOne(component.hash());
-      if (foundComponent) return foundComponent;
-    } catch (err) {
-      logger.error(`findComponent got an error ${err}`);
-    }
-    logger.debug(`failed finding a component ${component.id()} with hash: ${component.hash()}`);
-    return null;
-  }
-
-  getMany(ids: BitId[]): Promise<ComponentDef[]> {
+  getMany(ids: BitId[] | BitIds): Promise<ComponentDef[]> {
     logger.debug(`sources.getMany, Ids: ${ids.join(', ')}`);
     return Promise.all(
       ids.map((id) => {
@@ -68,27 +53,53 @@ export default class SourceRepository {
     );
   }
 
-  async get(bitId: BitId): Promise<?Component> {
-    const component = Component.fromBitId(bitId);
-    let foundComponent = await this.findComponent(component);
-    if (foundComponent instanceof Symlink) {
-      const realComponentId = BitId.parse(foundComponent.getRealComponentId());
-      foundComponent = await this.findComponent(Component.fromBitId(realComponentId));
-    }
-
+  async get(bitId: BitId): Promise<?ModelComponent> {
+    const component = ModelComponent.fromBitId(bitId);
+    const foundComponent: ?ModelComponent = await this._findComponent(component);
     if (foundComponent && bitId.hasVersion()) {
+      // $FlowFixMe
       const msg = `found ${bitId.toStringWithoutVersion()}, however version ${bitId.getVersion().versionNum}`;
+      // $FlowFixMe
       if (!foundComponent.versions[bitId.version]) {
-        logger.debug(`${msg} is not in the component versions array`);
+        logger.debugAndAddBreadCrumb('sources.get', `${msg} is not in the component versions array`);
         return null;
       }
-      const version = await this.objects().findOne(foundComponent.versions[bitId.version]);
+      // $FlowFixMe
+      const version = await this.objects().load(foundComponent.versions[bitId.version]);
       if (!version) {
-        logger.debug(`${msg} object was not found on the filesystem`);
+        logger.debugAndAddBreadCrumb('sources.get', `${msg} object was not found on the filesystem`);
         return null;
       }
     }
 
+    return foundComponent;
+  }
+
+  async _findComponent(component: ModelComponent): Promise<?ModelComponent> {
+    try {
+      const foundComponent = await this.objects().load(component.hash());
+      if (foundComponent instanceof Symlink) {
+        return this._findComponentBySymlink(foundComponent);
+      }
+      if (foundComponent) return foundComponent;
+    } catch (err) {
+      logger.error(`findComponent got an error ${err}`);
+    }
+    logger.debug(`failed finding a component ${component.id()} with hash: ${component.hash().toString()}`);
+    return null;
+  }
+
+  async _findComponentBySymlink(symlink: Symlink): Promise<?ModelComponent> {
+    const realComponentId: BitId = symlink.getRealComponentId();
+    const realModelComponent = ModelComponent.fromBitId(realComponentId);
+    const foundComponent = await this.objects().load(realModelComponent.hash());
+    if (!foundComponent) {
+      throw new Error(
+        `error: found a symlink object "${symlink.id()}" that references to a non-exist component "${realComponentId.toString()}".
+if you have the steps to reproduce the issue, please open a Github issue with the details.
+to quickly fix the issue, please delete the object at "${this.objects().objectPath(symlink.hash())}"`
+      );
+    }
     return foundComponent;
   }
 
@@ -99,9 +110,9 @@ export default class SourceRepository {
     });
   }
 
-  findOrAddComponent(props: ComponentProps): Promise<Component> {
-    const comp = Component.from(props);
-    return this.findComponent(comp).then((component) => {
+  findOrAddComponent(props: ComponentProps): Promise<ModelComponent> {
+    const comp = ModelComponent.from(props);
+    return this._findComponent(comp).then((component) => {
       if (!component) return comp;
       return component;
     });
@@ -113,7 +124,7 @@ export default class SourceRepository {
     return this.findOrAddComponent(source).then((component) => {
       return component.loadVersion(component.latest(), objectRepo).then((version) => {
         version.setCIProps(ciProps);
-        return objectRepo.persistOne(version);
+        return objectRepo._writeOne(version);
       });
     });
   }
@@ -124,7 +135,7 @@ export default class SourceRepository {
     return this.findOrAddComponent(source).then((component) => {
       return component.loadVersion(component.latest(), objectRepo).then((version) => {
         version.setSpecsResults(specsResults);
-        return objectRepo.persistOne(version);
+        return objectRepo._writeOne(version);
       });
     });
   }
@@ -144,119 +155,168 @@ export default class SourceRepository {
   }
 
   /**
-   * Given a consumer-component object, returns the Version representation.
-   * Useful for saving into the model or calculation the hash for comparing with other Version object.
+   * given a consumer-component object, returns the Version representation.
+   * useful for saving into the model or calculation the hash for comparing with other Version object.
+   * among other things, it reverts the path manipulation that was done when a component was loaded
+   * from the filesystem. it adds the originallySharedDir and strip the wrapDir.
    *
-   * @param consumerComponent
-   * @param consumer
-   * @param message
-   * @param flattenedDependencies
-   * @param dists
-   * @param specsResults
-   * @return {Promise.<{version: Version, dists: *, files: *}>}
+   * warning: Do not change anything on the consumerComponent instance! Only use its clone.
+   *
+   * @see model-components.toConsumerComponent() for the opposite action. (converting Version to
+   * ConsumerComponent).
    */
   async consumerComponentToVersion({
     consumerComponent,
+    consumer,
+    versionFromModel,
     message,
     flattenedDependencies,
     flattenedDevDependencies,
-    dists,
+    flattenedCompilerDependencies,
+    flattenedTesterDependencies,
     specsResults
   }: {
-    consumerComponent: ConsumerComponent,
+    consumerComponent: $ReadOnly<ConsumerComponent>,
+    consumer: Consumer,
+    versionFromModel?: Version,
     message?: string,
     flattenedDependencies?: Object,
     flattenedDevDependencies?: Object,
+    flattenedCompilerDependencies?: Object,
+    flattenedTesterDependencies?: Object,
     force?: boolean,
     verbose?: boolean,
-    dists?: Object,
     specsResults?: any
   }): Promise<Object> {
-    const setEol = (files: AbstractVinyl) => {
+    // $FlowFixMe
+    const clonedComponent: ConsumerComponent = consumerComponent.clone();
+    const setEol = (files: AbstractVinyl[]) => {
       if (!files) return;
       const result = files.map((file) => {
-        file.file = Source.from(eol.lf(file.contents, file.relative));
+        file.file = file.toSourceAsLinuxEOL();
         return file;
       });
       return result;
     };
-    const files =
-      consumerComponent.files && consumerComponent.files.length
-        ? consumerComponent.files.map((file) => {
-          return {
-            name: file.basename,
-            relativePath: consumerComponent.addSharedDir(file.relative),
-            file: Source.from(eol.lf(file.contents, file.relative)),
-            test: file.test
-          };
-        })
-        : null;
+    const manipulateDirs = (pathStr: PathOsBased): PathLinux => {
+      return revertDirManipulationForPath(pathStr, clonedComponent.originallySharedDir, clonedComponent.wrapDir);
+    };
+
+    const files = consumerComponent.files.map((file) => {
+      return {
+        name: file.basename,
+        relativePath: manipulateDirs(file.relative),
+        file: file.toSourceAsLinuxEOL(),
+        test: file.test
+      };
+    });
+    const dists = clonedComponent.dists.toDistFilesModel(
+      consumer,
+      consumerComponent.originallySharedDir,
+      consumerComponent.compiler
+    );
     const compilerFiles = setEol(R.path(['compiler', 'files'], consumerComponent));
     const testerFiles = setEol(R.path(['tester', 'files'], consumerComponent));
 
-    const username = globalConfig.getSync(CFG_USER_NAME_KEY);
-    const email = globalConfig.getSync(CFG_USER_EMAIL_KEY);
+    const [username, email] = await Promise.all([
+      globalConfig.get(CFG_USER_NAME_KEY),
+      globalConfig.get(CFG_USER_EMAIL_KEY)
+    ]);
 
-    consumerComponent.mainFile = consumerComponent.addSharedDir(consumerComponent.mainFile);
-    consumerComponent.getAllDependencies().forEach((dependency) => {
+    clonedComponent.mainFile = manipulateDirs(clonedComponent.mainFile);
+    clonedComponent.getAllDependencies().forEach((dependency) => {
+      // ignoreVersion because when persisting the tag is higher than currently exist in .bitmap
+      const depFromBitMap = consumer.bitMap.getComponentIfExist(dependency.id, { ignoreVersion: true });
       dependency.relativePaths.forEach((relativePath) => {
         if (!relativePath.isCustomResolveUsed) {
           // for isCustomResolveUsed it was never stripped
-          relativePath.sourceRelativePath = consumerComponent.addSharedDir(relativePath.sourceRelativePath);
+          relativePath.sourceRelativePath = manipulateDirs(relativePath.sourceRelativePath);
+          if (depFromBitMap && depFromBitMap.origin === COMPONENT_ORIGINS.IMPORTED) {
+            // when a dependency is imported directly, we need to also change the
+            // destinationRelativePath, which is the path written in the link file, however, the
+            // dir manipulation should be according to this dependency component, not the
+            // consumerComponent passed to this function
+            relativePath.destinationRelativePath = revertDirManipulationForPath(
+              relativePath.destinationRelativePath,
+              depFromBitMap.originallySharedDir,
+              depFromBitMap.wrapDir
+            );
+          }
         }
       });
     });
-    const version = Version.fromComponent({
-      component: consumerComponent,
+    clonedComponent.overrides.addOriginallySharedDir(clonedComponent.originallySharedDir);
+    const version: Version = Version.fromComponent({
+      component: clonedComponent,
+      versionFromModel,
       files,
       dists,
       flattenedDependencies,
       flattenedDevDependencies,
+      flattenedCompilerDependencies,
+      flattenedTesterDependencies,
       specsResults,
       message,
       username,
       email
     });
+    // $FlowFixMe it's ok to override the pendingVersion attribute
     consumerComponent.pendingVersion = version; // helps to validate the version against the consumer-component
 
-    return { version, files, compilerFiles, testerFiles };
+    return { version, files, dists, compilerFiles, testerFiles };
   }
 
   async addSource({
     source,
+    consumer,
     flattenedDependencies,
     flattenedDevDependencies,
+    flattenedCompilerDependencies,
+    flattenedTesterDependencies,
     message,
     exactVersion,
     releaseType,
-    dists,
     specsResults
   }: {
     source: ConsumerComponent,
-    flattenedDependencies: BitId[],
-    flattenedDevDependencies: BitId[],
+    consumer: Consumer,
+    flattenedDependencies: BitIds,
+    flattenedDevDependencies: BitIds,
+    flattenedCompilerDependencies: BitIds,
+    flattenedTesterDependencies: BitIds,
     message: string,
     exactVersion: ?string,
     releaseType: string,
-    dists: ?Object,
     specsResults?: any
-  }): Promise<Component> {
+  }): Promise<ModelComponent> {
     const objectRepo = this.objects();
 
     // if a component exists in the model, add a new version. Otherwise, create a new component on the model
     const component = await this.findOrAddComponent(source);
-    const { version, files, compilerFiles, testerFiles } = await this.consumerComponentToVersion({
+    // TODO: instead of doing that like this we should use:
+    // const versionFromModel = await component.loadVersion(source.usedVersion, this.scope.objects);
+    // it looks like it's exactly the same code but it's not working from some reason
+    const versionRef = component.versions[source.usedVersion];
+
+    let versionFromModel;
+    if (versionRef) {
+      versionFromModel = await this.scope.getObject(versionRef.hash);
+    }
+    const { version, files, dists, compilerFiles, testerFiles } = await this.consumerComponentToVersion({
       consumerComponent: source,
+      consumer,
+      versionFromModel,
       message,
       flattenedDependencies,
       flattenedDevDependencies,
-      dists,
+      flattenedCompilerDependencies,
+      flattenedTesterDependencies,
       specsResults
     });
     component.addVersion(version, releaseType, exactVersion);
     objectRepo.add(version).add(component);
 
-    if (files) files.forEach(file => objectRepo.add(file.file));
+    files.forEach(file => objectRepo.add(file.file));
     if (dists) dists.forEach(dist => objectRepo.add(dist.file));
     if (compilerFiles) compilerFiles.forEach(file => objectRepo.add(file.file));
     if (testerFiles) testerFiles.forEach(file => objectRepo.add(file.file));
@@ -264,30 +324,34 @@ export default class SourceRepository {
     return component;
   }
 
-  putAdditionalVersion(
-    component: Component,
+  async putAdditionalVersion(
+    component: ModelComponent,
     version: Version,
-    message,
+    message: string,
     releaseType: string = DEFAULT_BIT_RELEASE_TYPE
-  ): Component {
+  ): Promise<ModelComponent> {
+    const [username, email] = await Promise.all([
+      globalConfig.get(CFG_USER_NAME_KEY),
+      globalConfig.get(CFG_USER_EMAIL_KEY)
+    ]);
     version.log = {
       message,
-      username: globalConfig.getSync(CFG_USER_NAME_KEY),
-      email: globalConfig.getSync(CFG_USER_EMAIL_KEY),
+      username,
+      email,
       date: Date.now().toString()
     };
     component.addVersion(version, releaseType);
     return this.put({ component, objects: [version] });
   }
 
-  put({ component, objects }: ComponentTree): Component {
+  put({ component, objects }: ComponentTree): ModelComponent {
     logger.debug(`sources.put, id: ${component.id()}, versions: ${component.listVersions().join(', ')}`);
     const repo: Repository = this.objects();
     repo.add(component);
 
     const isObjectShouldBeAdded = (obj) => {
       // don't add a component if it's already exist locally with more versions
-      if (obj instanceof Component) {
+      if (obj instanceof ModelComponent) {
         const loaded = repo.loadSync(obj.hash(), false);
         if (loaded) {
           if (Object.keys(loaded.versions) > Object.keys(obj.versions)) {
@@ -305,30 +369,54 @@ export default class SourceRepository {
   }
 
   /**
-   * removeVersion - remove specific component version from component
-   * @param {Component} component - component to remove version from
-   * @param {string} version - version to remove.
-   * @param persist
+   * remove specified component versions from component.
+   * if all versions of a component were deleted, delete also the component.
+   * it doesn't persist anything to the filesystem.
+   * (repository.persist() needs to be called at the end of the operation)
    */
-  async removeVersion(component: Component, version: string, persist: boolean = true): Promise<void> {
-    logger.debug(`removing version ${version} of ${component.id()} from a local scope`);
+  removeComponentVersions(component: ModelComponent, versions: string[]): void {
+    logger.debug(`removeComponentVersion, component ${component.id()}, versions ${versions.join(', ')}`);
     const objectRepo = this.objects();
-    const modifiedComponent = await component.removeVersion(objectRepo, version);
-    objectRepo.add(modifiedComponent);
-    if (persist) await objectRepo.persist();
-    return modifiedComponent;
+    versions.forEach((version) => {
+      const ref = component.removeVersion(version);
+      objectRepo.removeObject(ref);
+    });
+
+    if (component.versionArray.length) {
+      objectRepo.add(component); // add the modified component object
+    } else {
+      // if all versions were deleted, delete also the component itself from the model
+      objectRepo.removeObject(component.hash());
+    }
   }
 
   /**
-   * clean - remove component or component version
-   * @param {BitId} bitId - id to remove
-   * @param {boolean} deepRemove - remove all component refs or only version refs
+   * @see this.removeComponent()
+   *
    */
-  async clean(bitId: BitId, deepRemove: boolean = false): Promise<void> {
-    logger.debug(`sources.clean: ${bitId}, deepRemove: ${deepRemove.toString()}`);
+  async removeComponentById(bitId: BitId): Promise<void> {
+    logger.debug(`sources.removeComponentById: ${bitId.toString()}`);
     const component = await this.get(bitId);
     if (!component) return;
-    await component.remove(this.objects(), deepRemove);
+    this.removeComponent(component);
+  }
+
+  /**
+   * remove all versions objects of the component from local scope.
+   * if deepRemove is true, it removes also the refs associated with the removed versions.
+   * finally, it removes the component object itself
+   * it doesn't physically delete from the filesystem.
+   * the actual delete is done at a later phase, once Repository.persist() is called.
+   *
+   * @param {ModelComponent} component
+   * @param {boolean} [deepRemove=false] - whether remove all the refs or only the version array
+   */
+  removeComponent(component: ModelComponent): void {
+    const repo = this.objects();
+    logger.debug(`sources.removeComponent: removing a component ${component.id()} from a local scope`);
+    const objectRefs = component.versionArray;
+    objectRefs.push(component.hash());
+    repo.removeManyObjects(objectRefs);
   }
 
   /**
@@ -336,7 +424,7 @@ export default class SourceRepository {
    * here, we assume that there is no conflict between the two, otherwise, this.merge() would throw
    * a MergeConflict exception.
    */
-  mergeTwoComponentsObjects(existingComponent: Component, incomingComponent: Component): Component {
+  mergeTwoComponentsObjects(existingComponent: ModelComponent, incomingComponent: ModelComponent): ModelComponent {
     // the base component to save is the existingComponent because it might contain local data that
     // is not available in the remote component, such as the "state" property.
     const mergedComponent = existingComponent;
@@ -373,11 +461,11 @@ export default class SourceRepository {
     { component, objects }: ComponentTree,
     inScope: boolean = false,
     local: boolean = true
-  ): Promise<Component> {
+  ): Promise<ModelComponent> {
     if (inScope) component.scope = this.scope.name;
-    const existingComponent: ?Component = await this.findComponent(component);
+    const existingComponent: ?ModelComponent = await this._findComponent(component);
     if (!existingComponent) return this.put({ component, objects });
-    const locallyChanged = await existingComponent.isLocallyChanged();
+    const locallyChanged = existingComponent.isLocallyChanged();
     if ((local && !locallyChanged) || component.compatibleWith(existingComponent, local)) {
       logger.debug(`sources.merge component ${component.id()}`);
       const mergedComponent = this.mergeTwoComponentsObjects(existingComponent, component);

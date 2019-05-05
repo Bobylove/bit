@@ -3,7 +3,7 @@ import isolate from './lib/isolate';
 import remove from './lib/remove';
 import deprecate from './lib/deprecate';
 import listScope from './lib/list-scope';
-import { commitAction, commitAllAction } from './lib/commit';
+import { tagAction, tagAllAction } from './lib/tag';
 import status from './lib/status';
 import { build, buildAll } from './lib/build';
 import importAction from './lib/import';
@@ -17,7 +17,7 @@ import { add as remoteAdd, list as remoteList, remove as remoteRm } from './lib/
 import config from './lib/global-config';
 import getDriver from './lib/get-driver';
 import watchAll from './lib/watch';
-import add from './lib/add';
+import { addOne as add, addMany } from './lib/add';
 import untrack from './lib/untrack';
 import unTagAction from './lib/untag';
 import move from './lib/move';
@@ -25,7 +25,10 @@ import link from './lib/link';
 import checkout from './lib/checkout';
 import merge from './lib/merge';
 import diff from './lib//diff';
+import ejectConf from './lib/eject-conf';
+import injectConf from './lib/inject-conf';
 import migrate from './lib/migrate';
+import ejectAction from './lib/eject';
 import dependencyStatus from './lib/dependency_status';
 import login from './lib/login';
 
@@ -38,8 +41,8 @@ export {
   deprecate,
   buildAll,
   listScope,
-  commitAction,
-  commitAllAction,
+  tagAction,
+  tagAllAction,
   status,
   build,
   importAction,
@@ -54,6 +57,7 @@ export {
   getDriver,
   watchAll,
   add,
+  addMany,
   dependencyStatus,
   untrack,
   unTagAction,
@@ -62,6 +66,9 @@ export {
   checkout,
   merge,
   diff,
+  ejectConf,
+  injectConf,
   migrate,
+  ejectAction,
   login
 };

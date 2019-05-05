@@ -1,26 +1,22 @@
 /** @flow */
-import * as fs from 'fs';
-import * as path from 'path';
-import Source from './source';
+import fs from 'fs-extra';
 import { LICENSE_FILENAME } from '../../../constants';
+import { AbstractVinyl } from '.';
 
-export default class License extends Source {
-  write(bitPath: string, force?: boolean = true): Promise<any> {
-    const filePath = path.join(bitPath, LICENSE_FILENAME);
-    if (!force && fs.existsSync(filePath)) return Promise.resolve();
-    return new Promise((resolve, reject) =>
-      fs.writeFile(filePath, this.src, (err, res) => {
-        if (err) return reject(err);
-        return resolve(res);
-      })
-    );
+export default class License extends AbstractVinyl {
+  override: ?boolean = true;
+  src: string;
+
+  write(): Promise<any> {
+    if (!this.override && fs.existsSync(this.path)) return Promise.resolve();
+    return fs.outputFile(this.path, this.contents);
   }
 
   serialize() {
-    return this.src;
+    return this.contents.toString();
   }
 
   static deserialize(str: string) {
-    return new License(str);
+    return new License({ path: LICENSE_FILENAME, contents: str ? Buffer.from(str) : null });
   }
 }

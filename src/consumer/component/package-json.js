@@ -2,60 +2,56 @@
 import R from 'ramda';
 import path from 'path';
 import fs from 'fs-extra';
-import format from 'string-format';
-import { BitId } from '../../bit-id';
-import Component from '../component';
-import {
-  COMPONENT_ORIGINS,
-  CFG_REGISTRY_DOMAIN_PREFIX,
-  DEFAULT_REGISTRY_DOMAIN_PREFIX,
-  DEFAULT_SEPARATOR,
-  ASTERISK,
-  COMPONENTES_DEPENDECIES_REGEX,
-  NODE_PATH_COMPONENT_SEPARATOR
-} from '../../constants';
+import { BitId, BitIds } from '../../bit-id';
+import type Component from '../component/consumer-component';
+import { COMPONENT_ORIGINS, SUB_DIRECTORIES_GLOB_PATTERN, PACKAGE_JSON } from '../../constants';
 import ComponentMap from '../bit-map/component-map';
 import { pathRelativeLinux } from '../../utils';
-import { getSync } from '../../api/consumer/lib/global-config';
-import Consumer from '../consumer';
-import { Dependencies } from './dependencies';
+import type Consumer from '../consumer';
+import type { Dependencies } from './dependencies';
 import { pathNormalizeToLinux } from '../../utils/path';
+import getNodeModulesPathOfComponent from '../../utils/bit/component-node-modules-path';
 import type { PathLinux } from '../../utils/path';
 import logger from '../../logger/logger';
 import GeneralError from '../../error/general-error';
-import BitMap from '../bit-map';
+import JSONFile from './sources/json-file';
+import npmRegistryName from '../../utils/bit/npm-registry-name';
+import componentIdToPackageName from '../../utils/bit/component-id-to-package-name';
+import DataToPersist from './sources/data-to-persist';
 
-export type PackageJsonInstance = {};
+// the instance comes from bit-javascript PackageJson class
+export type PackageJsonInstance = { write: Function, bit?: Object, componentRootFolder: string };
 
 /**
  * Add components as dependencies to root package.json
  */
-async function addComponentsToRoot(consumer: Consumer, componentsIds: BitId[]) {
-  const importedComponents = componentsIds.filter((id) => {
-    const componentMap = consumer.bitMap.getComponent(id);
-    return componentMap.origin === COMPONENT_ORIGINS.IMPORTED;
-  });
-  if (!importedComponents || !importedComponents.length) return;
+async function addComponentsToRoot(consumer: Consumer, components: Component[]): Promise<void> {
+  const componentsToAdd = components.reduce((acc, component) => {
+    const componentMap = consumer.bitMap.getComponent(component.id);
+    if (componentMap.origin !== COMPONENT_ORIGINS.IMPORTED) return acc;
+    if (!componentMap.rootDir) {
+      throw new GeneralError(`rootDir is missing from an imported component ${component.id.toString()}`);
+    }
+    const locationAsUnixFormat = convertToValidPathForPackageManager(componentMap.rootDir);
+    const packageName = componentIdToPackageName(component.id, component.bindingPrefix);
+    acc[packageName] = locationAsUnixFormat;
+    return acc;
+  }, {});
+  if (R.isEmpty(componentsToAdd)) return;
+  await _addDependenciesPackagesIntoPackageJson(consumer.getPath(), componentsToAdd);
+}
 
-  const driver = await consumer.driver.getDriver(false);
-  const PackageJson = driver.PackageJson;
-  const componentsToAdd = R.fromPairs(
-    importedComponents.map((componentId) => {
-      const componentMap = consumer.bitMap.getComponent(componentId);
-      if (!componentMap.rootDir) throw new GeneralError(`rootDir is missing from an imported component ${componentId}`);
-      const locationAsUnixFormat = convertToValidPathForPackageManager(componentMap.rootDir);
-      return [componentId.toStringWithoutVersion(), locationAsUnixFormat];
-    })
-  );
-  const registryPrefix = getRegistryPrefix();
-  await PackageJson.addComponentsIntoExistingPackageJson(consumer.getPath(), componentsToAdd, registryPrefix);
+async function _addDependenciesPackagesIntoPackageJson(dir: string, dependencies: Object) {
+  const packageJson = (await getPackageJsonObject(dir)) || { dependencies: {} };
+  packageJson.dependencies = Object.assign({}, packageJson.dependencies, dependencies);
+  return writePackageJsonFromObject(dir, packageJson);
 }
 
 /**
  * Add given components with their versions to root package.json
  */
-async function addComponentsWithVersionToRoot(consumer: Consumer, componentsIds: BitId[]) {
-  const driver = await consumer.driver.getDriver(false);
+async function addComponentsWithVersionToRoot(consumer: Consumer, componentsIds: BitIds) {
+  const driver = consumer.driver.getDriver(false);
   const PackageJson = driver.PackageJson;
 
   const componentsToAdd = R.fromPairs(
@@ -63,7 +59,7 @@ async function addComponentsWithVersionToRoot(consumer: Consumer, componentsIds:
       return [id.toStringWithoutVersion(), id.version];
     })
   );
-  await PackageJson.addComponentsIntoExistingPackageJson(consumer.getPath(), componentsToAdd, getRegistryPrefix());
+  await PackageJson.addComponentsIntoExistingPackageJson(consumer.getPath(), componentsToAdd, npmRegistryName());
 }
 
 function convertToValidPathForPackageManager(pathStr: PathLinux): string {
@@ -74,14 +70,19 @@ function convertToValidPathForPackageManager(pathStr: PathLinux): string {
 /**
  * Only imported components should be saved with relative path in package.json
  * If a component is nested or imported as a package dependency, it should be saved with the version
+ * If a component is authored, no need to save it as a dependency of the imported component because
+ * the root package.json takes care of it already.
  */
 function getPackageDependencyValue(
   dependencyId: BitId,
   parentComponentMap: ComponentMap,
-  dependencyComponentMap?: ComponentMap
-) {
+  dependencyComponentMap?: ?ComponentMap
+): ?string {
   if (!dependencyComponentMap || dependencyComponentMap.origin === COMPONENT_ORIGINS.NESTED) {
     return dependencyId.version;
+  }
+  if (dependencyComponentMap.origin === COMPONENT_ORIGINS.AUTHORED) {
+    return null;
   }
   const dependencyRootDir = dependencyComponentMap.rootDir;
   if (!dependencyRootDir) {
@@ -92,9 +93,9 @@ function getPackageDependencyValue(
   return convertToValidPathForPackageManager(rootDirRelative);
 }
 
-async function getPackageDependency(consumer: Consumer, dependencyId: BitId, parentId: BitId) {
-  const dependencyComponentMap = consumer.bitMap.getComponent(dependencyId);
+function getPackageDependency(consumer: Consumer, dependencyId: BitId, parentId: BitId): ?string {
   const parentComponentMap = consumer.bitMap.getComponent(parentId);
+  const dependencyComponentMap = consumer.bitMap.getComponentIfExist(dependencyId);
   return getPackageDependencyValue(dependencyId, parentComponentMap, dependencyComponentMap);
 }
 
@@ -102,49 +103,49 @@ async function changeDependenciesToRelativeSyntax(
   consumer: Consumer,
   components: Component[],
   dependencies: Component[]
-) {
-  const dependenciesIds = dependencies.map(dependency => dependency.id.toStringWithoutVersion());
-  const driver = await consumer.driver.getDriver(false);
+): Promise<JSONFile[]> {
+  const dependenciesIds = BitIds.fromArray(dependencies.map(dependency => dependency.id));
+  const driver = consumer.driver.getDriver(false);
   const PackageJson = driver.PackageJson;
-  const updateComponent = async (component) => {
-    const componentMap = component.getComponentMap(consumer.bitMap);
+  const updateComponentPackageJson = async (component): Promise<?JSONFile> => {
+    const componentMap = consumer.bitMap.getComponent(component.id);
     let packageJson;
     try {
       packageJson = await PackageJson.load(componentMap.rootDir);
     } catch (e) {
       return Promise.resolve(); // package.json doesn't exist, that's fine, no need to update anything
     }
-    const getPackages = (dev: boolean = false) => {
-      const deps = dev ? component.devDependencies.get() : component.dependencies.get();
-      const packages = deps.map((dependency) => {
+    const getPackages = (deps: Dependencies) => {
+      const packages = deps.get().map((dependency) => {
         const dependencyId = dependency.id.toStringWithoutVersion();
-        if (dependenciesIds.includes(dependencyId)) {
-          const dependencyComponent = dependencies.find(d => d.id.toStringWithoutVersion() === dependencyId);
+        if (dependenciesIds.searchWithoutVersion(dependency.id)) {
+          const dependencyComponent = dependencies.find(d => d.id.isEqualWithoutVersion(dependency.id));
           // $FlowFixMe dependencyComponent must be found (two line earlier there is a check for that)
-          const dependencyComponentMap = dependencyComponent.getComponentMap(consumer.bitMap);
-          const dependencyLocation = getPackageDependencyValue(dependencyId, componentMap, dependencyComponentMap);
-          return [dependencyId, dependencyLocation];
+          const dependencyComponentMap = consumer.bitMap.getComponentIfExist(dependencyComponent.id);
+          const dependencyPackageValue = getPackageDependencyValue(dependencyId, componentMap, dependencyComponentMap);
+          return dependencyPackageValue ? [dependencyId, dependencyPackageValue] : [];
         }
         return [];
       });
       return R.fromPairs(packages);
     };
-
-    packageJson.addDependencies(getPackages(), getRegistryPrefix());
-    packageJson.addDevDependencies(getPackages(true), getRegistryPrefix());
-    return packageJson.write({ override: true });
+    const devDeps = getPackages(component.devDependencies);
+    const compilerDeps = getPackages(component.compilerDependencies);
+    const testerDeps = getPackages(component.testerDependencies);
+    packageJson.addDependencies(getPackages(component.dependencies), npmRegistryName());
+    packageJson.addDevDependencies({ ...devDeps, ...compilerDeps, ...testerDeps }, npmRegistryName());
+    // return packageJson.write({ override: true });
+    return JSONFile.load({
+      // $FlowFixMe
+      base: componentMap.rootDir, // $FlowFixMe
+      path: path.join(componentMap.rootDir, PACKAGE_JSON),
+      content: packageJson,
+      override: true
+    });
   };
-  return Promise.all(components.map(component => updateComponent(component)));
-}
-
-function getRegistryPrefix(): string {
-  return getSync(CFG_REGISTRY_DOMAIN_PREFIX) || DEFAULT_REGISTRY_DOMAIN_PREFIX;
-}
-
-function convertIdToNpmName(id: BitId, withVersion = false): string {
-  const registryPrefix = getRegistryPrefix();
-  const npmName = `${registryPrefix}/${id.toStringWithoutVersion().replace(/\//g, NODE_PATH_COMPONENT_SEPARATOR)}`;
-  return withVersion ? `${npmName}@${id.version}` : npmName;
+  // $FlowFixMe
+  const packageJsonFiles = await Promise.all(components.map(component => updateComponentPackageJson(component)));
+  return packageJsonFiles.filter(file => file);
 }
 
 async function write(
@@ -155,22 +156,45 @@ async function write(
   writeBitDependencies?: boolean = false,
   excludeRegistryPrefix?: boolean
 ): Promise<PackageJsonInstance> {
+  const { packageJson, distPackageJson } = preparePackageJsonToWrite(
+    consumer,
+    component,
+    bitDir,
+    override,
+    writeBitDependencies,
+    excludeRegistryPrefix
+  );
+  await packageJson.write({ override });
+  if (distPackageJson) await distPackageJson.write({ override });
+  return packageJson;
+}
+
+function preparePackageJsonToWrite(
+  consumer: Consumer,
+  component: Component,
+  bitDir: string,
+  override?: boolean = true,
+  writeBitDependencies?: boolean = false,
+  excludeRegistryPrefix?: boolean
+): { packageJson: PackageJsonInstance, distPackageJson: ?PackageJsonInstance } {
+  logger.debug(`package-json.preparePackageJsonToWrite. bitDir ${bitDir}. override ${override.toString()}`);
   const PackageJson = consumer.driver.getDriver(false).PackageJson;
-  const getBitDependencies = async (dev: boolean = false) => {
+  const getBitDependencies = (dependencies: Dependencies) => {
     if (!writeBitDependencies) return {};
-    const dependencies: Dependencies = dev ? component.devDependencies : component.dependencies;
-    const dependenciesPackages = dependencies.get().map(async (dep) => {
-      const packageDependency = await getPackageDependency(consumer, dep.id, component.id);
+    const dependenciesPackages = dependencies.get().map((dep) => {
+      const packageDependency = getPackageDependency(consumer, dep.id, component.id);
       return [dep.id.toStringWithoutVersion(), packageDependency];
     });
-    return R.fromPairs(await Promise.all(dependenciesPackages));
+    return R.fromPairs(dependenciesPackages);
   };
-  const bitDependencies = await getBitDependencies();
-  const bitDevDependencies = await getBitDependencies(true);
-  const registryPrefix = getRegistryPrefix();
+  const bitDependencies = getBitDependencies(component.dependencies);
+  const bitDevDependencies = getBitDependencies(component.devDependencies);
+  const bitCompilerDependencies = getBitDependencies(component.compilerDependencies);
+  const bitTesterDependencies = getBitDependencies(component.testerDependencies);
+  const registryPrefix = component.bindingPrefix || npmRegistryName();
   const name = excludeRegistryPrefix
-    ? component.id.toStringWithoutVersion().replace(/\//g, '.')
-    : convertIdToNpmName(component.id);
+    ? componentIdToPackageName(component.id, component.bindingPrefix, false)
+    : componentIdToPackageName(component.id, component.bindingPrefix);
   const getPackageJsonInstance = (dir) => {
     const packageJson = new PackageJson(dir, {
       name,
@@ -178,123 +202,131 @@ async function write(
       homepage: component._getHomepage(),
       main: pathNormalizeToLinux(component.dists.calculateMainDistFile(component.mainFile)),
       dependencies: component.packageDependencies,
-      // Add envsPackageDependencies to the devDependencies in the package.json
-      devDependencies: { ...component.devPackageDependencies, ...component.envsPackageDependencies },
+      // Add environments PackageDependencies to the devDependencies in the package.json
+      devDependencies: {
+        ...component.devPackageDependencies,
+        ...component.compilerPackageDependencies,
+        ...component.testerPackageDependencies
+      },
       peerDependencies: component.peerPackageDependencies,
       componentRootFolder: dir,
       license: `SEE LICENSE IN ${!R.isEmpty(component.license) ? 'LICENSE' : 'UNLICENSED'}`
     });
     packageJson.addDependencies(bitDependencies, registryPrefix);
-    packageJson.addDevDependencies(bitDevDependencies, registryPrefix);
+    packageJson.addDevDependencies(
+      { ...bitDevDependencies, ...bitCompilerDependencies, ...bitTesterDependencies },
+      registryPrefix
+    );
     return packageJson;
   };
   const packageJson = getPackageJsonInstance(bitDir);
-
+  let distPackageJson;
   if (!component.dists.isEmpty() && !component.dists.areDistsInsideComponentDir) {
     const distRootDir = component.dists.distsRootDir;
     if (!distRootDir) throw new GeneralError('component.dists.distsRootDir is not defined yet');
-    const distPackageJson = getPackageJsonInstance(distRootDir);
-    await distPackageJson.write({ override });
+    distPackageJson = getPackageJsonInstance(distRootDir);
   }
 
-  await packageJson.write({ override });
-  return packageJson;
+  return { packageJson, distPackageJson };
 }
 
 async function updateAttribute(
   consumer: Consumer,
   componentDir: PathLinux,
   attributeName: string,
-  attributeValue: string
+  attributeValue: string,
+  writeFile: ?boolean = true
 ): Promise<*> {
-  const PackageJson = consumer.driver.getDriver(false).PackageJson;
-  try {
-    const packageJson = await PackageJson.load(componentDir);
-    packageJson[attributeName] = attributeValue;
-    return packageJson.write({ override: true });
-  } catch (e) {
-    // package.json doesn't exist, that's fine, no need to update anything
-    return Promise.resolve();
-  }
+  const packageJson = await getPackageJsonObject(componentDir);
+  if (!packageJson) return null; // package.json doesn't exist, that's fine, no need to update anything
+  packageJson[attributeName] = attributeValue;
+  if (writeFile) await writePackageJsonFromObject(componentDir, packageJson);
+  return packageJson;
 }
 
 /**
  * Adds workspace array to package.json - only if user wants to work with yarn workspaces
- *
- * formatedComponentsPath- used to resolve import path dsl. replacing all {}->*
- * for example {components/{namespace} -> components/*
- *
  */
-async function addWorkspacesToPackageJson(
-  consumer: Consumer,
-  rootDir: string,
-  componentsDefaultDirectory: string,
-  dependenciesDirectory: string,
-  customImportPath: ?string
-) {
-  if (
-    consumer.bitJson.manageWorkspaces &&
-    consumer.bitJson.packageManager === 'yarn' &&
-    consumer.bitJson.useWorkspaces
-  ) {
-    const formatedComponentsPath = format(componentsDefaultDirectory, {
-      name: ASTERISK,
-      scope: ASTERISK,
-      namespace: ASTERISK
-    });
-    const formatedRegexPath = formatedComponentsPath
-      .split(DEFAULT_SEPARATOR)
-      .map(part => (R.contains(ASTERISK, part) ? ASTERISK : part))
-      .join(DEFAULT_SEPARATOR);
-    const driver = await consumer.driver.getDriver(false);
+async function addWorkspacesToPackageJson(consumer: Consumer, customImportPath: ?string) {
+  if (consumer.config.manageWorkspaces && consumer.config.packageManager === 'yarn' && consumer.config.useWorkspaces) {
+    const rootDir = consumer.getPath();
+    const dependenciesDirectory = consumer.config.dependenciesDirectory;
+    const { componentsDefaultDirectory } = consumer.dirStructure;
+    const driver = consumer.driver.getDriver(false);
     const PackageJson = driver.PackageJson;
 
     await PackageJson.addWorkspacesToPackageJson(
       rootDir,
-      formatedRegexPath,
-      dependenciesDirectory + COMPONENTES_DEPENDECIES_REGEX,
+      componentsDefaultDirectory + SUB_DIRECTORIES_GLOB_PATTERN,
+      dependenciesDirectory + SUB_DIRECTORIES_GLOB_PATTERN,
       customImportPath ? consumer.getPathRelativeToConsumer(customImportPath) : customImportPath
     );
   }
 }
 
-async function removeComponentsFromNodeModules(consumer: Consumer, componentIds: BitId[]) {
+async function removeComponentsFromNodeModules(consumer: Consumer, componentIds: BitIds) {
   logger.debug(`removeComponentsFromNodeModules: ${componentIds.map(c => c.toString()).join(', ')}`);
-  const registryPrefix = getRegistryPrefix();
+  const registryPrefix = npmRegistryName();
   // paths without scope name, don't have a symlink in node-modules
   const pathsToRemove = componentIds
     .map((id) => {
-      return id.scope ? Consumer.getNodeModulesPathOfComponent(registryPrefix, id) : null;
+      return id.scope ? getNodeModulesPathOfComponent(registryPrefix, id) : null;
     })
     .filter(a => a); // remove null
 
   logger.debug(`deleting the following paths: ${pathsToRemove.join('\n')}`);
   // $FlowFixMe nulls were removed in the previous filter function
-  return Promise.all(pathsToRemove.map(componentPath => fs.remove(path.join(consumer.getPath(), componentPath))));
+  return Promise.all(pathsToRemove.map(componentPath => fs.remove(consumer.toAbsolutePath(componentPath))));
 }
 
-async function removeComponentsFromWorkspacesAndDependencies(
-  consumer: Consumer,
-  rootDir: string,
-  bitMap: BitMap,
-  componentIds: BitId[]
-) {
-  const driver = await consumer.driver.getDriver(false);
+async function removeComponentsFromWorkspacesAndDependencies(consumer: Consumer, componentIds: BitIds) {
+  const rootDir = consumer.getPath();
+  const driver = consumer.driver.getDriver(false);
   const PackageJson = driver.PackageJson;
-  if (
-    consumer.bitJson.manageWorkspaces &&
-    consumer.bitJson.packageManager === 'yarn' &&
-    consumer.bitJson.useWorkspaces
-  ) {
-    const dirsToRemove = componentIds.map(id => bitMap.getComponent(id.toStringWithoutVersion()).rootDir);
+  if (consumer.config.manageWorkspaces && consumer.config.packageManager === 'yarn' && consumer.config.useWorkspaces) {
+    const dirsToRemove = componentIds.map(id => consumer.bitMap.getComponent(id, { ignoreVersion: true }).rootDir);
     await PackageJson.removeComponentsFromWorkspaces(rootDir, dirsToRemove);
   }
   await PackageJson.removeComponentsFromDependencies(
     rootDir,
-    getRegistryPrefix(),
+    npmRegistryName(),
     componentIds.map(id => id.toStringWithoutVersion())
   );
   await removeComponentsFromNodeModules(consumer, componentIds);
+}
+
+/**
+ * get the package.json object of the given dir, if not found, return null
+ */
+async function getPackageJsonObject(dir: string): Promise<?Object> {
+  try {
+    const packageJsonObject = await fs.readJson(composePath(dir));
+    return packageJsonObject;
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      // file not found
+      return null;
+    }
+    throw err;
+  }
+}
+
+function addPackageJsonDataToPersist(packageJson: PackageJsonInstance, dataToPersist: DataToPersist) {
+  const packageJsonPath = composePath(packageJson.componentRootFolder);
+  const jsonFile = JSONFile.load({
+    base: packageJson.componentRootFolder,
+    path: packageJsonPath,
+    content: packageJson
+  });
+  dataToPersist.addFile(jsonFile);
+}
+
+async function writePackageJsonFromObject(dir: string, data: Object) {
+  return fs.outputJSON(composePath(dir), data, { spaces: 2 });
+}
+
+function composePath(componentRootFolder: string) {
+  return path.join(componentRootFolder, PACKAGE_JSON);
 }
 
 export {
@@ -302,8 +334,12 @@ export {
   removeComponentsFromNodeModules,
   changeDependenciesToRelativeSyntax,
   write,
+  preparePackageJsonToWrite,
+  addPackageJsonDataToPersist,
   addComponentsWithVersionToRoot,
   updateAttribute,
   addWorkspacesToPackageJson,
+  getPackageJsonObject,
+  writePackageJsonFromObject,
   removeComponentsFromWorkspacesAndDependencies
 };

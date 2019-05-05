@@ -4,6 +4,7 @@ import indexer from './indexer';
 import { search } from './searcher';
 import { loadConsumer } from '../consumer';
 import { loadScope } from '../scope';
+import { getScopeRemotes } from '../scope/scope-remotes';
 
 async function searchLocally(queryStr: string, reindex: boolean = false): Promise<any> {
   let scopePath;
@@ -11,7 +12,7 @@ async function searchLocally(queryStr: string, reindex: boolean = false): Promis
     return loadConsumer()
       .then((consumer) => {
         scopePath = consumer.scope.path;
-        return consumer.scope.listStage();
+        return consumer.scope.listLocal();
       })
       .then((components) => {
         return indexer.indexAll(scopePath, components);
@@ -27,7 +28,7 @@ async function searchLocally(queryStr: string, reindex: boolean = false): Promis
 
 async function searchRemotely(queryStr: string, scope: string, reindex: boolean = false): Promise<any> {
   return loadConsumer().then((consumer) => {
-    return consumer.scope.remotes().then(remotes =>
+    return getScopeRemotes(consumer.scope).then(remotes =>
       remotes.resolve(scope, consumer.scope.name).then((remote) => {
         return remote.search(queryStr, reindex);
       })
@@ -40,7 +41,7 @@ async function scopeSearch(path: string, query: string, reindex: boolean): Promi
   if (reindex) {
     return loadScope(path)
       .then((scope) => {
-        return scope.listStage();
+        return scope.listLocal();
       })
       .then((components) => {
         return indexer.indexAll(path, components);

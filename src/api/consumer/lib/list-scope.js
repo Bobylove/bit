@@ -1,69 +1,40 @@
 /** @flow */
 import { loadConsumer, Consumer } from '../../../consumer';
-import { loadScope, Scope } from '../../../scope';
-import { ConsumerNotFound } from '../../../consumer/exceptions';
+import { Scope } from '../../../scope';
 import loader from '../../../cli/loader';
 import { BEFORE_REMOTE_LIST, BEFORE_LOCAL_LIST } from '../../../cli/loader/loader-messages';
-import Remotes from '../../../remotes/remotes';
 import Remote from '../../../remotes/remote';
-import { COMPONENT_ORIGINS } from '../../../constants';
+import ComponentsList from '../../../consumer/component/components-list';
+import type { ListScopeResult } from '../../../consumer/component/components-list';
+import { getScopeRemotes } from '../../../scope/scope-remotes';
 
-export default function list({
+export default (async function list({
   scopeName,
   showAll, // include nested
-  cache,
   showRemoteVersion
 }: {
   scopeName?: string,
-  showAll?: boolean,
-  cache?: boolean,
-  showRemoteVersion?: boolean
-}): Promise<string[]> {
-  const remoteList = (remote: Remote) => {
-    loader.start(BEFORE_REMOTE_LIST);
-    return remote.list();
-  };
-  const scopeList = async (scope: Scope, consumer: Consumer) => {
-    loader.start(BEFORE_LOCAL_LIST);
-    const components = cache ? await scope.list(showRemoteVersion) : await scope.listStage();
-    if (consumer) {
-      components.forEach((component) => {
-        const existingBitMapId = consumer.bitMap.getExistingComponentId(component.id.toStringWithoutVersion(), [
-          COMPONENT_ORIGINS.AUTHORED,
-          COMPONENT_ORIGINS.IMPORTED
-        ]);
-        if (existingBitMapId) {
-          component.currentlyUsedVersion = existingBitMapId;
-          component.componentMap = consumer.bitMap.getComponent(existingBitMapId);
-        }
-      });
-    }
-    if (showAll) return components;
-    return components.filter(
-      component => component.componentMap && component.componentMap.origin !== COMPONENT_ORIGINS.NESTED
-    );
-  };
+  showAll: boolean,
+  showRemoteVersion: boolean
+}): Promise<ListScopeResult[]> {
+  const consumer: Consumer = await loadConsumer();
+  const scope: Scope = consumer.scope;
+  if (scopeName) {
+    const remotes = await getScopeRemotes(scope);
+    const remote: Remote = await remotes.resolve(scopeName, scope);
+    return remoteList(remote);
+  }
 
-  return loadConsumer()
-    .then((consumer) => {
-      const scope = consumer.scope;
+  return scopeList(consumer, showAll, showRemoteVersion);
+});
 
-      if (scopeName) {
-        return scope.remotes().then(remotes => remotes.resolve(scopeName, scope.name).then(remoteList));
-      }
+function remoteList(remote: Remote): Promise<ListScopeResult[]> {
+  loader.start(BEFORE_REMOTE_LIST);
+  return remote.list();
+}
 
-      return scopeList(scope, consumer);
-    })
-    .catch((err) => {
-      if (!(err instanceof ConsumerNotFound)) throw err;
-
-      if (scopeName) {
-        return Remotes.getScopeRemote(scopeName).then(remoteList);
-      }
-
-      return loadScope(process.cwd())
-        .catch(() => Promise.reject(err))
-        .then(scopeList)
-        .catch(e => Promise.reject(e));
-    });
+async function scopeList(consumer: Consumer, showAll: boolean, showRemoteVersion: boolean): Promise<ListScopeResult[]> {
+  loader.start(BEFORE_LOCAL_LIST);
+  const componentsList = new ComponentsList(consumer);
+  return componentsList.listScope(showRemoteVersion, showAll);
 }

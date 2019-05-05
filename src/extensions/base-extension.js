@@ -3,18 +3,22 @@
 import path from 'path';
 import R from 'ramda';
 import fs from 'fs-extra';
+import Ajv from 'ajv';
 import semver from 'semver';
 import logger, { createExtensionLogger } from '../logger/logger';
 import { Scope } from '../scope';
-import { ScopeNotFound } from '../scope/exceptions';
 import { BitId } from '../bit-id';
 import type { EnvExtensionOptions } from './env-extension';
 import type { ExtensionOptions } from './extension';
 import ExtensionNameNotValid from './exceptions/extension-name-not-valid';
+import ExtensionGetDynamicConfigError from './exceptions/extension-get-dynamic-config-error';
 import type { PathOsBased } from '../utils/path';
 import { Analytics } from '../analytics/analytics';
 import ExtensionLoadError from './exceptions/extension-load-error';
 import Environment from '../environment';
+import ExtensionSchemaError from './exceptions/extension-schema-error';
+
+const ajv = new Ajv();
 
 const CORE_EXTENSIONS_PATH = './core-extensions';
 
@@ -46,6 +50,7 @@ type StaticProps = BaseArgs & {
   dynamicConfig: Object,
   filePath: string,
   rootDir?: ?string,
+  schema?: ?Object,
   script?: Function,
   disabled: boolean,
   loaded: boolean,
@@ -68,6 +73,10 @@ type ExtensionPath = {
   componentPath: string
 };
 
+export type InitOptions = {
+  writeConfigFilesOnAction: ?boolean
+};
+
 // export type BaseExtensionProps = {
 //   ...InstanceSpecificProps,
 //   ...StaticProps
@@ -83,15 +92,18 @@ export default class BaseExtension {
   filePath: string;
   rootDir: string;
   rawConfig: Object;
+  schema: ?Object;
   options: Object;
   dynamicConfig: Object;
   context: ?Object;
   script: ?Function; // Store the required plugin
+  _initOptions: ?InitOptions; // Store the required plugin
   api = _getConcreteBaseAPI({ name: this.name });
 
   constructor(extensionProps: BaseExtensionProps) {
     this.name = extensionProps.name;
     this.rawConfig = extensionProps.rawConfig;
+    this.schema = extensionProps.schema;
     this.options = extensionProps.options;
     this.dynamicConfig = extensionProps.dynamicConfig || extensionProps.rawConfig;
     this.context = extensionProps.context;
@@ -103,15 +115,48 @@ export default class BaseExtension {
     this.api = extensionProps.api;
   }
 
+  get writeConfigFilesOnAction() {
+    if (!this.initOptions) {
+      return false;
+    }
+    return this.initOptions.writeConfigFilesOnAction;
+  }
+
+  get initOptions() {
+    return this._initOptions;
+  }
+
+  set initOptions(opts: ?Object) {
+    const defaultInitOpts = {
+      writeConfigFilesOnAction: false
+    };
+    if (!opts) {
+      this._initOptions = defaultInitOpts;
+      return;
+    }
+    const res = {};
+    if (opts.write) {
+      res.writeConfigFilesOnAction = true;
+    }
+    this._initOptions = res;
+  }
+
   /**
    * Run the extension's init function
    */
   async init(throws: boolean = false): Promise<boolean> {
     Analytics.addBreadCrumb('base-extension', 'initialize extension');
     try {
+      let initOptions = {};
       if (this.script && this.script.init && typeof this.script.init === 'function') {
-        await this.script.init({ rawConfig: this.rawConfig, dynamicConfig: this.dynamicConfig, api: this.api });
+        initOptions = this.script.init({
+          rawConfig: this.rawConfig,
+          dynamicConfig: this.dynamicConfig,
+          api: this.api
+        });
       }
+      // wrap in promise, in case a script has async init
+      this.initOptions = await Promise.resolve(initOptions);
       this.initialized = true;
       // Make sure to not kill the process if an extension didn't load correctly
     } catch (err) {
@@ -165,7 +210,7 @@ export default class BaseExtension {
       this.filePath = resolvedPath;
       this.rootDir = componentPath;
     }
-    this.name = _addVersionToNameFromPathIfMissing(this.name, this.rootDir);
+    this.name = _addVersionToNameFromPathIfMissing(this.name, this.rootDir, this.options);
     const baseProps = await BaseExtension.loadFromFile({
       name: this.name,
       filePath: this.filePath,
@@ -178,6 +223,7 @@ export default class BaseExtension {
       this.loaded = baseProps.loaded;
       this.script = baseProps.script;
       this.dynamicConfig = baseProps.dynamicConfig;
+      await this.init();
     }
   }
 
@@ -215,7 +261,7 @@ export default class BaseExtension {
     throws = false,
     context
   }: BaseLoadArgsProps): Promise<BaseExtensionProps> {
-    Analytics.addBreadCrumb('base-extension', 'load extension');
+    logger.debug(`base-extension loading ${name}`);
     const concreteBaseAPI = _getConcreteBaseAPI({ name });
     if (options.file) {
       let absPath = options.file;
@@ -245,9 +291,8 @@ export default class BaseExtension {
     };
     // Require extension from scope
     if (scopePath) {
-      // $FlowFixMe
       const { resolvedPath, componentPath } = _getExtensionPath(name, scopePath, options.core);
-      const nameWithVersion = _addVersionToNameFromPathIfMissing(name, componentPath);
+      const nameWithVersion = _addVersionToNameFromPathIfMissing(name, componentPath, options);
       staticExtensionProps = await BaseExtension.loadFromFile({
         name: nameWithVersion,
         filePath: resolvedPath,
@@ -262,7 +307,6 @@ export default class BaseExtension {
   }
 
   static loadFromModelObject(modelObject: string | BaseExtensionModel) {
-    Analytics.addBreadCrumb('base-extension', 'load extension from model object');
     let staticExtensionProps: StaticProps;
     if (typeof modelObject === 'string') {
       staticExtensionProps = {
@@ -300,8 +344,7 @@ export default class BaseExtension {
     options = {},
     throws = false
   }: BaseLoadFromFileArgsProps): Promise<StaticProps> {
-    logger.info(`loading extension ${name} from ${filePath}`);
-    Analytics.addBreadCrumb('base-extension', 'load extension from file');
+    logger.debug(`base-extension, loading extension ${name} from ${filePath}`);
     const extensionProps: StaticProps = {
       name,
       rawConfig,
@@ -340,8 +383,13 @@ export default class BaseExtension {
       // $FlowFixMe
       const script = require(filePath); // eslint-disable-line
       extensionProps.script = script.default ? script.default : script;
-      if (extensionProps.script.getDynamicConfig && typeof extensionProps.script.getDynamicConfig === 'function') {
-        extensionProps.dynamicConfig = await extensionProps.script.getDynamicConfig({ rawConfig });
+      if (extensionProps.script.getSchema && typeof extensionProps.script.getSchema === 'function') {
+        // the function may or may not be a promise
+        extensionProps.schema = await Promise.resolve(extensionProps.script.getSchema());
+        const valid = ajv.validate(extensionProps.schema, rawConfig);
+        if (!valid) {
+          throw new ExtensionSchemaError(name, ajv.errorsText());
+        }
       }
       // Make sure to not kill the process if an extension didn't load correctly
     } catch (err) {
@@ -354,21 +402,41 @@ export default class BaseExtension {
       logger.error(err);
       extensionProps.loaded = false;
       if (throws) {
-        throw new ExtensionLoadError(err, extensionProps.name);
+        let printStack = true;
+        if (err instanceof ExtensionSchemaError) {
+          printStack = false;
+        }
+        throw new ExtensionLoadError(err, extensionProps.name, printStack);
       }
       return extensionProps;
     }
     extensionProps.loaded = true;
     return extensionProps;
   }
+
+  static loadDynamicConfig(extensionProps: StaticProps): ?Object {
+    logger.debug('base-extension - loadDynamicConfig');
+    const getDynamicConfig = R.path(['script', 'getDynamicConfig'], extensionProps);
+    if (getDynamicConfig && typeof getDynamicConfig === 'function') {
+      try {
+        const dynamicConfig = getDynamicConfig({
+          rawConfig: extensionProps.rawConfig
+        });
+        return dynamicConfig;
+      } catch (err) {
+        throw new ExtensionGetDynamicConfigError(err, extensionProps.name);
+      }
+    }
+    return undefined;
+  }
 }
 
-const _getExtensionPath = (name: string, scopePath: ?string, isCore: boolean = false): ExtensionPath => {
+const _getExtensionPath = (name: string, scopePath: string, isCore: boolean = false): ExtensionPath => {
   if (isCore) {
     return _getCoreExtensionPath(name);
   }
   if (!scopePath) {
-    throw new ScopeNotFound();
+    throw new Error('base-extension._getExtensionPath expects to get scopePath');
   }
   return _getRegularExtensionPath(name, scopePath);
 };
@@ -384,7 +452,7 @@ const _getCoreExtensionPath = (name: string): ExtensionPath => {
 const _getRegularExtensionPath = (name: string, scopePath: string): ExtensionPath => {
   let bitId: BitId;
   try {
-    bitId = BitId.parse(name);
+    bitId = BitId.parse(name, true); // todo: make sure it always has a scope
   } catch (err) {
     throw new ExtensionNameNotValid(name);
   }
@@ -419,17 +487,17 @@ const _getExtensionVersionFromComponentPath = (componentPath: string): ?string =
   return version;
 };
 
-const _addVersionToNameFromPathIfMissing = (name: string, componentPath: string): string => {
+const _addVersionToNameFromPathIfMissing = (name: string, componentPath: string, options: Object): string => {
+  if (options && options.core) return name; // if it's a core extension, it's not a bit-id.
   let bitId: BitId;
   try {
-    bitId = BitId.parse(name);
+    bitId = BitId.parse(name, true); // @todo: make sure it always has a scope name
   } catch (err) {
     throw new ExtensionNameNotValid(name);
   }
   if (bitId.getVersion().latest) {
     const version = _getExtensionVersionFromComponentPath(componentPath);
-    bitId.version = version;
-    return bitId.toString();
+    return bitId.changeVersion(version).toString();
   }
   return name;
 };

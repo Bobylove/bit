@@ -1,6 +1,7 @@
 /** @flow */
+import fs from 'fs-extra';
 import pathlib from 'path';
-import { writeFile, cleanObject, readFile, existsSync } from '../utils';
+import { writeFile, cleanObject } from '../utils';
 import { Remote } from '../remotes';
 import { SCOPE_JSON } from '../constants';
 import BitId from '../bit-id/bit-id';
@@ -82,9 +83,10 @@ export class ScopeJson {
     return this;
   }
 
-  rmRemote(name: string) {
+  rmRemote(name: string): boolean {
+    if (!this.remotes[name]) return false;
     delete this.remotes[name];
-    return this;
+    return true;
   }
 
   async write(path: string) {
@@ -98,7 +100,7 @@ export class ScopeJson {
   static async loadFromFile(scopeJsonPath: string): Promise<ScopeJson> {
     let rawScopeJson;
     try {
-      rawScopeJson = await readFile(scopeJsonPath);
+      rawScopeJson = await fs.readFile(scopeJsonPath);
     } catch (err) {
       if (err.code === 'ENOENT') throw new ScopeJsonNotFound(scopeJsonPath);
       throw err;
@@ -107,7 +109,7 @@ export class ScopeJson {
   }
 
   getPopulatedLicense(): Promise<?string> {
-    if (!this.get('license') || !existsSync(this.get('license'))) return Promise.resolve();
-    return readFile(this.get('license')).then(license => license.toString());
+    if (!this.get('license') || !fs.existsSync(this.get('license'))) return Promise.resolve();
+    return fs.readFile(this.get('license')).then(license => license.toString());
   }
 }

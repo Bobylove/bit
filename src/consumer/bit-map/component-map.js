@@ -1,16 +1,20 @@
 /** @flow */
 import R from 'ramda';
+import fs from 'fs-extra';
 import path from 'path';
 import logger from '../../logger/logger';
 import { COMPONENT_ORIGINS, BIT_MAP } from '../../constants';
 import { pathNormalizeToLinux, pathJoinLinux, pathRelativeLinux, isValidPath } from '../../utils';
-import type { PathOsBasedRelative, PathLinux, PathOsBased } from '../../utils/path';
-import { Consumer } from '..';
+import type { PathOsBasedRelative, PathLinux, PathOsBased, PathLinuxRelative } from '../../utils/path';
+import type Consumer from '../consumer';
 import { BitId } from '../../bit-id';
 import AddComponents from '../component-ops/add-components';
+import type { AddContext } from '../component-ops/add-components';
 import { NoFiles, EmptyDirectory } from '../component-ops/add-components/exceptions';
 import GeneralError from '../../error/general-error';
 import ValidationError from '../../error/validation-error';
+import ComponentNotFoundInPath from '../component/exceptions/component-not-found-in-path';
+import ConfigDir from './config-dir';
 
 export type ComponentOrigin = $Keys<typeof COMPONENT_ORIGINS>;
 
@@ -21,19 +25,24 @@ export type ComponentMapFile = {
 };
 
 export type ComponentMapData = {
+  id: BitId,
   files: ComponentMapFile[],
   mainFile: PathLinux,
-  rootDir?: PathLinux,
-  trackDir?: PathLinux,
+  rootDir?: ?PathLinux,
+  trackDir?: ?PathLinux,
+  configDir?: ?PathLinux | ?ConfigDir | string,
   origin: ComponentOrigin,
-  dependencies?: string[],
-  mainDistFile?: PathLinux,
-  originallySharedDir?: PathLinux
+  dependencies?: ?(string[]),
+  mainDistFile?: ?PathLinux,
+  originallySharedDir?: ?PathLinux,
+  wrapDir?: ?PathLinux,
+  exported?: ?boolean
 };
 
 export type PathChange = { from: PathLinux, to: PathLinux };
 
 export default class ComponentMap {
+  id: BitId;
   files: ComponentMapFile[];
   mainFile: PathLinux;
   rootDir: ?PathLinux; // always set for IMPORTED and NESTED.
@@ -42,32 +51,71 @@ export default class ComponentMap {
   // be relative to consumer-root. (we can't save in the model relative to rootDir, otherwise the
   // dependencies paths won't work).
   trackDir: ?PathLinux; // relevant for AUTHORED only when a component was added as a directory, used for tracking changes in that dir
+  configDir: ?ConfigDir;
   origin: ComponentOrigin;
   dependencies: ?(string[]); // needed for the link process
   mainDistFile: ?PathLinux; // needed when there is a build process involved
   originallySharedDir: ?PathLinux; // directory shared among a component and its dependencies by the original author. Relevant for IMPORTED only
+  wrapDir: ?PathLinux; // a wrapper directory needed when a user adds a package.json file to the component root so then it won't collide with Bit generated one
+  // wether the compiler / tester are detached from the workspace global configuration
+  markBitMapChangedCb: Function;
+  exported: ?boolean; // relevant for authored components only, it helps finding out whether a component has a scope
   constructor({
+    id,
     files,
     mainFile,
     rootDir,
     trackDir,
+    configDir,
     origin,
     dependencies,
     mainDistFile,
-    originallySharedDir
+    originallySharedDir,
+    wrapDir
   }: ComponentMapData) {
+    let confDir;
+    if (configDir && typeof configDir === 'string') {
+      confDir = new ConfigDir(configDir);
+    } else if (configDir && configDir instanceof ConfigDir) {
+      confDir = configDir.clone();
+    }
+    this.id = id;
     this.files = files;
     this.mainFile = mainFile;
     this.rootDir = rootDir;
     this.trackDir = trackDir;
+    this.configDir = confDir;
     this.origin = origin;
     this.dependencies = dependencies;
     this.mainDistFile = mainDistFile;
     this.originallySharedDir = originallySharedDir;
+    this.wrapDir = wrapDir;
   }
 
   static fromJson(componentMapObj: ComponentMapData): ComponentMap {
     return new ComponentMap(componentMapObj);
+  }
+
+  toPlainObject(): Object {
+    let res = {
+      id: this.id,
+      files: this.files,
+      mainFile: this.mainFile,
+      rootDir: this.rootDir,
+      trackDir: this.trackDir,
+      configDir: this.configDir ? this.configDir.linuxDirPath : undefined,
+      origin: this.origin,
+      dependencies: this.dependencies,
+      mainDistFile: this.mainDistFile,
+      originallySharedDir: this.originallySharedDir,
+      wrapDir: this.wrapDir,
+      exported: this.exported
+    };
+    const notNil = (val) => {
+      return !R.isNil(val);
+    };
+    res = R.filter(notNil, res);
+    return res;
   }
 
   static getPathWithoutRootDir(rootDir: PathLinux, filePath: PathLinux): PathLinux {
@@ -90,6 +138,10 @@ export default class ComponentMap {
       file.relativePath = newPath;
     });
     return changes;
+  }
+
+  setMarkAsChangedCb(markAsChangedBinded: Function) {
+    this.markBitMapChangedCb = markAsChangedBinded;
   }
 
   _findFile(fileName: PathLinux): ?ComponentMapFile {
@@ -174,12 +226,24 @@ export default class ComponentMap {
    * if one of the added files is outside of the trackDir, remove the trackDir attribute
    */
   removeTrackDirIfNeeded(): void {
-    if (this.trackDir) {
-      for (const file of this.files) {
-        if (!file.relativePath.startsWith(this.trackDir)) {
-          this.trackDir = undefined;
-          return;
+    if (!this.trackDir) return;
+    if (this.origin !== COMPONENT_ORIGINS.AUTHORED) {
+      this.trackDir = undefined;
+      return;
+    }
+    for (const file of this.files) {
+      if (!file.relativePath.startsWith(this.trackDir)) {
+        // Make sure we are not getting to case where we have config dir with {COMPONENT_DIR} but there is no component dir
+        // This might happen in the following case:
+        // User add a folder to bit which create the track dir
+        // Then the user eject the config to that dir
+        // Then the user adding a new file to that component which is outside of the component dir
+        // This will remove the trackDir, so just before the remove we resolve it
+        if (this.configDir) {
+          this.configDir = this.configDir.getResolved({ componentDir: this.trackDir });
         }
+        this.trackDir = undefined;
+        return;
       }
     }
   }
@@ -189,9 +253,57 @@ export default class ComponentMap {
    */
   getTrackDir(): ?PathLinux {
     if (this.origin === COMPONENT_ORIGINS.AUTHORED) return this.trackDir;
-    if (this.origin === COMPONENT_ORIGINS.IMPORTED) return this.rootDir;
+    if (this.origin === COMPONENT_ORIGINS.IMPORTED) {
+      return this.wrapDir ? pathJoinLinux(this.rootDir, this.wrapDir) : this.rootDir;
+    }
     // DO NOT track nested components!
     return null;
+  }
+
+  /**
+   * this.rootDir is not defined for author. instead, the current workspace is the rootDir
+   * also, for imported environments (compiler/tester) components the rootDir is empty
+   */
+  getRootDir(): PathLinuxRelative {
+    return this.rootDir || '.';
+  }
+
+  /**
+   * directory of the component (root / track)
+   */
+  getComponentDir(): ?PathLinux {
+    if (this.origin === COMPONENT_ORIGINS.AUTHORED) return this.trackDir;
+    return this.rootDir;
+  }
+
+  setConfigDir(val: ?PathLinux) {
+    if (val === null || val === undefined) {
+      delete this.configDir;
+      this.markBitMapChangedCb();
+      return;
+    }
+    this.markBitMapChangedCb();
+    this.configDir = new ConfigDir(val);
+  }
+
+  async deleteConfigDirIfNotExists() {
+    const resolvedDir = this.getBaseConfigDir();
+    if (resolvedDir) {
+      const isExist = await fs.exists(resolvedDir);
+      if (!isExist) {
+        this.setConfigDir(null);
+      }
+    }
+  }
+
+  /**
+   * Get resolved base config dir (the dir where the bit.json is) after resolving the DSL
+   */
+  getBaseConfigDir(): ?PathLinux {
+    if (!this.configDir) return null;
+    const componentDir = this.getComponentDir();
+    const configDir = this.configDir && this.configDir.getResolved({ componentDir }).getEnvTypeCleaned().linuxDirPath;
+    return configDir;
   }
 
   /**
@@ -203,6 +315,7 @@ export default class ComponentMap {
     if (trackDir) {
       const trackDirAbsolute = path.join(consumer.getPath(), trackDir);
       const trackDirRelative = path.relative(process.cwd(), trackDirAbsolute);
+      if (!fs.existsSync(trackDirAbsolute)) throw new ComponentNotFoundInPath(trackDirRelative);
       const addParams = {
         componentPaths: [trackDirRelative || '.'],
         id: id.toString(),
@@ -211,7 +324,8 @@ export default class ComponentMap {
         origin: this.origin
       };
       const numOfFilesBefore = this.files.length;
-      const addComponents = new AddComponents(consumer, addParams);
+      const addContext: AddContext = { consumer };
+      const addComponents = new AddComponents(addContext, addParams);
       try {
         await addComponents.add();
       } catch (err) {
@@ -242,8 +356,13 @@ export default class ComponentMap {
     this.files = R.sortBy(R.prop('relativePath'), this.files);
   }
 
+  clone() {
+    // $FlowFixMe - there is some issue with the config dir type
+    return new ComponentMap(this);
+  }
+
   validate(): void {
-    const errorMessage = `failed adding or updating a component-map record (of ${BIT_MAP} file).`;
+    const errorMessage = `failed adding or updating a ${BIT_MAP} record of ${this.id.toString()}.`;
     if (!this.mainFile) throw new ValidationError(`${errorMessage} mainFile attribute is missing`);
     if (!isValidPath(this.mainFile)) {
       throw new ValidationError(`${errorMessage} mainFile attribute ${this.mainFile} is invalid`);
@@ -262,6 +381,12 @@ export default class ComponentMap {
     if (this.trackDir && this.origin !== COMPONENT_ORIGINS.AUTHORED) {
       throw new ValidationError(`${errorMessage} trackDir attribute should be set for AUTHORED component only`);
     }
+    if (this.originallySharedDir && this.origin !== COMPONENT_ORIGINS.IMPORTED) {
+      throw new ValidationError(
+        `${errorMessage} originallySharedDir attribute should be set for IMPORTED components only`
+      );
+    }
+
     if (!this.files || !this.files.length) throw new ValidationError(`${errorMessage} files list is missing`);
     this.files.forEach((file) => {
       if (!isValidPath(file.relativePath)) {

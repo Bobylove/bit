@@ -4,7 +4,6 @@ import Command from '../../command';
 import { merge } from '../../../api/consumer';
 import type { ApplyVersionResults, ApplyVersionResult } from '../../../consumer/versions-ops/merge-version';
 import { getMergeStrategy, FileStatus } from '../../../consumer/versions-ops/merge-version';
-import { BitId } from '../../../bit-id';
 
 export const applyVersionReport = (
   components: ApplyVersionResult[],
@@ -31,7 +30,8 @@ export const applyVersionReport = (
 
 export default class Merge extends Command {
   name = 'merge <version> <ids...>';
-  description = 'merge changes of different component versions';
+  description = `merge changes of different component versions
+  the id can be used with wildcards (e.g. bit merge 0.0.1 "utils/*")`;
   alias = '';
   opts = [
     ['o', 'ours', 'in case of a conflict, override the used version with the current modification'],
@@ -52,9 +52,8 @@ export default class Merge extends Command {
       manual?: boolean
     }
   ): Promise<ApplyVersionResults> {
-    const bitIds = ids.map(id => BitId.parse(id));
     const mergeStrategy = getMergeStrategy(ours, theirs, manual);
-    return merge(version, bitIds, mergeStrategy);
+    return merge(version, ids, mergeStrategy);
   }
 
   report({ components, version }: ApplyVersionResults): string {

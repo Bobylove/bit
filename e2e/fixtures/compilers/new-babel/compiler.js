@@ -9,6 +9,24 @@ let logger;
 const compiler = {
   init: ({ rawConfig, dynamicConfig, api }) => {
     logger = api.getLogger();
+    return { write: true };
+  },
+  getSchema: () => {
+    const schema = {
+      "$id": "http://example.com/schemas/schema.json",
+      "type": "object",
+      "properties": {
+        "valToDynamic": {
+          "type": "string",
+          "description": "prop which will be changed to dynamic val"
+        },
+        "bablercPath": {
+          "type": "string",
+          "description": "path to the .babelrc file"
+        }
+      }
+    };
+    return schema;
   },
   getDynamicConfig: ({ rawConfig }) => {
     const dynamicConfig = Object.assign({}, rawConfig);
@@ -19,9 +37,12 @@ const compiler = {
   },
   getDynamicPackageDependencies: ({ rawConfig, dynamicConfig, configFiles, context }) => {
     const dynamicPackageDependencies = {};
+    let babelrc = {};
     const vinylBabelrc = getFileByName('.babelrc', configFiles);
-    const rawBabelrc = vinylBabelrc.contents.toString();
-    const babelrc = JSON.parse(rawBabelrc);
+    if (vinylBabelrc) {
+      const rawBabelrc = vinylBabelrc.contents.toString();
+      babelrc = JSON.parse(rawBabelrc);
+    }
     const pluginsNames = babelrc.plugins || [];
     const presetsNames = babelrc.presets || [];
     // Function which get a result aggregator and a function to transform name to package name
@@ -51,18 +72,25 @@ const compiler = {
     api,
     context
   }) => {
+    let babelrc = {};
+    let plugins = [];
+    let presets = [];
     const vinylBabelrc = getFileByName('.babelrc', configFiles);
-    const rawBabelrc = vinylBabelrc.contents.toString();
-    const babelrc = JSON.parse(rawBabelrc);
+    if (vinylBabelrc){
+      const rawBabelrc = vinylBabelrc.contents.toString();
+      babelrc = JSON.parse(rawBabelrc);
+      plugins = babelrc.plugins || [];
+      presets = babelrc.presets || [];
+    }
     const componentDir = context && context.componentDir
 
     if (componentDir) {
-      babelrc.plugins = babelrc.plugins.map(pluginName => resolvePlugin(componentDir, pluginName));
-      babelrc.presets = babelrc.presets.map(presetName => resolvePreset(componentDir, presetName));
+      babelrc.plugins = plugins.map(pluginName => resolvePlugin(componentDir, pluginName));
+      babelrc.presets = presets.map(presetName => resolvePreset(componentDir, presetName));
     }
 
     try {
-      const builtFiles = files.map(file => runBabel(file, babelrc, context.rootDistFolder)).reduce((a, b) => a.concat(b));
+      const builtFiles = files.map(file => runBabel(file, babelrc, context.rootDistDir)).reduce((a, b) => a.concat(b));
       return {files: builtFiles};
     } catch (e) {
       throw e;
@@ -141,17 +169,21 @@ function getPackageVersion(packageName, packageJson) {
 
 function runBabel(file, options, distPath) {
   const { code, map } = babel.transform(file.contents.toString(), options);
-  const mappings = new Vinyl({
-    contents: Buffer.from(map.mappings),
-    base: distPath,
-    path: path.join(distPath, file.relative),
-    basename: `${file.basename}.map`
-  });
+  let mappings;
+  if (map) {
+    mappings = new Vinyl({
+      contents: Buffer.from(map.mappings),
+      base: distPath,
+      path: path.join(distPath, file.relative),
+      basename: `${file.basename}.map`
+    });
+  }
   const distFile = file.clone();
   distFile.base = distPath;
   distFile.path = path.join(distPath, file.relative);
-  distFile.contents = code ? Buffer.from(`${code}\n\n//# sourceMappingURL=${mappings.basename}`) : Buffer.from(code);
-  return [mappings, distFile];
+  distFile.contents = mappings ? Buffer.from(`${code}\n\n//# sourceMappingURL=${mappings.basename}`) : Buffer.from(code);
+  const result = mappings ? [mappings, distFile] : [distFile];
+  return result;
 }
 
 module.exports = compiler;

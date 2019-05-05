@@ -1,13 +1,14 @@
 /** @flow */
 import { loadScope, Scope } from '../../../scope';
 import { BitId } from '../../../bit-id';
-import Version from '../../../scope/models/version';
+import type Version from '../../../scope/models/version';
 import { LATEST_BIT_VERSION, VERSION_DELIMITER } from '../../../constants';
 import GeneralError from '../../../error/general-error';
 
 export default (async function catComponent(id: string) {
   const scope: Scope = await loadScope();
-  const bitId = BitId.parse(id);
+  const bitId: BitId = await scope.getParsedId(id);
+  // $FlowFixMe unclear what's the issue here
   const component = await scope.sources.get(bitId);
   if (!component) throw new GeneralError('component was not found');
   if (bitId.hasVersion()) {
